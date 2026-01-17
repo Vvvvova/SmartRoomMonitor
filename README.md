@@ -13,7 +13,7 @@
 
 This project implements a smart indoor climate monitor that goes beyond simple temperature/humidity display. It uses **Absolute Humidity calculations** to accurately detect ventilation events, track their effectiveness, and provide actionable recommendations — all running on a resource-constrained microcontroller.
 
-The system was developed for personal use (interface in Russian) and serves as a practical case study in embedded systems design, covering real-time data processing, concurrent task management, and stable long-term operation.
+The system was developed for personal home use (interface localized accordingly) and serves as a practical case study in embedded systems design, covering real-time data processing, concurrent task management, and stable long-term operation.
 
 ---
 
@@ -52,7 +52,7 @@ The system was developed for personal use (interface in Russian) and serves as a
 |:-------------:|:------------:|:------------:|
 | ![Dashboard](docs/images/dashboard.png) | ![OLED](docs/images/oled.png) | ![Telegram](docs/images/telegram.png) |
 
-> The dashboard screenshot was translated to English for this README. The actual device interface uses Russian, as it was built for personal home use.
+> The dashboard screenshot was translated to English for this README. The actual device interface is localized for personal home use.
 
 ---
 
@@ -162,7 +162,7 @@ SmartRoomMonitor/
 ├── docs/
 │   └── images/               # Screenshots
 ├── documentation.md          # Technical documentation (English)
-├── documentation_ru.md       # Technical documentation (Russian)
+├── documentation_ru.md       # Technical documentation (original)
 └── platformio.ini            # Build configuration
 ```
 
@@ -202,7 +202,7 @@ SmartRoomMonitor/
 Detailed technical documentation covering code structure, algorithms, and design decisions:
 
 - [English version](documentation.md)
-- [Russian version (original)](documentation_ru.md)
+- [Original version](documentation_ru.md)
 
 ---
 
