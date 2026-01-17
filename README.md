@@ -1,171 +1,192 @@
-# 🏠 SmartRoomMonitor (ACM-1)
+# SmartRoomMonitor (ACM-1)
 
-![Maintenance](https://img.shields.io/badge/Maintenance-No-red.svg)
-[![Platform](https://img.shields.io/badge/Platform-ESP32-blue.svg)](https://www.espressif.com/en/products/socs/esp32)
-[![Framework](https://img.shields.io/badge/Framework-Arduino-00979D.svg)](https://www.arduino.cc/)
+**Autonomous climate monitoring system built on ESP32 with physics-based ventilation analysis, real-time notifications, and a responsive web interface.**
 
-[![Framework](https://img.shields.io/badge/Framework-Arduino-00979D.svg)](https://www.arduino.cc/)
-[![PlatformIO](https://img.shields.io/badge/Build%20System-PlatformIO-orange.svg)](https://platformio.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-
----
-
-## ✨ Features
-
-- 📊 **Real-time monitoring** — Temperature, humidity, and dew point displayed on OLED and web dashboard.
-- 🪟 **Smart window detection** — Automatically detects when you open/close windows using physics-based algorithms (Absolute Humidity).
-- 🧠 **Physics Engine** — Uses Absolute Humidity (g/m³) rather than just Relative Humidity (%) ensuring accurate advice regardless of temperature changes.
-- 🍄 **Mold risk alerts** — Proactively warns when the dew point margin becomes dangerously low (< 3°C).
-- 🤖 **Telegram bot** — Receive notifications, check status, and control settings remotely.
-- 🌐 **Web dashboard** — Beautiful dark-themed interface with live Chart.js graphs and history data.
-- ⛅ **Weather API** — Integrates outdoor weather data (Open-Meteo) for context-aware ventilation advice.
-- 🌙 **Night mode** — OLED display turns off automatically at night (configurable hours).
+![Maintenance](https://img.shields.io/badge/Status-Completed-green.svg)
+![Platform](https://img.shields.io/badge/Platform-ESP32-blue.svg)
+![Framework](https://img.shields.io/badge/Framework-Arduino%20%2B%20FreeRTOS-00979D.svg)
+![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)
 
 ---
 
-## 📸 Screenshots
+## Overview
+
+This project implements a smart indoor climate monitor that goes beyond simple temperature/humidity display. It uses **Absolute Humidity calculations** to accurately detect ventilation events, track their effectiveness, and provide actionable recommendations — all running on a resource-constrained microcontroller.
+
+The system was developed for personal use (interface in Russian) and serves as a practical case study in embedded systems design, covering real-time data processing, concurrent task management, and stable long-term operation.
+
+---
+
+## Technical Highlights
+
+### Embedded Systems & Concurrency
+- **Dual-core utilization**: Sensor reading task pinned to Core 1, network/UI tasks on Core 0
+- **FreeRTOS task management** with `vTaskDelayUntil` for precise timing intervals
+- **Thread-safe data access** using `std::timed_mutex` with configurable timeouts
+- **Watchdog-safe streaming**: Chunked HTTP responses with periodic yields to prevent WDT resets
+
+### Algorithm Design
+- **4-state finite state machine** for ventilation cycle management (STABLE → VENTILATING → TARGET_MET / INEFFICIENT)
+- **Physics-based detection**: Uses Absolute Humidity (g/m³) instead of Relative Humidity (%) to eliminate temperature-induced false positives
+- **Sliding window analysis**: 6-point buffer (3 min) for plateau detection with configurable slope thresholds
+- **Rebound detection v2.0**: Trend-based window close detection (+0.15°C over 2 min) with fallback heuristics
+- **Adaptive target calculation**: Dynamic humidity goal based on starting conditions (`max(50%, startHum - 15%)`)
+
+### Memory & Stability
+- **Zero heap allocation in hot paths**: Static ring buffer (500 entries), no `String` objects in runtime loops
+- **Chunked JSON streaming** for `/api/history` endpoint — sends data in 32-record batches to avoid stack overflow
+- **EMA filtering** with anomaly rejection (jumps > 2°C discarded) for sensor stability
+- **Deterministic baseline updates** every 50 readings (~5 min) — no `rand()` calls
+
+### Integration
+- **Telegram Bot API**: Subscriber management, state-change notifications, mold risk alerts with hysteresis
+- **Open-Meteo Weather API**: Outdoor humidity comparison for context-aware ventilation advice
+- **Async HTTP Server** (ESPAsyncWebServer): Non-blocking request handling with live Chart.js dashboard
+- **NTP time sync** with automatic reconnection logic
+
+---
+
+## Screenshots
 
 | Web Dashboard | OLED Display | Telegram Bot |
 |:-------------:|:------------:|:------------:|
 | ![Dashboard](docs/images/dashboard.png) | ![OLED](docs/images/oled.png) | ![Telegram](docs/images/telegram.png) |
 
-> *Note:* The web dashboard screenshot above was translated to English for demonstration purposes. The actual device interface and Telegram bot use **Russian language**, as this system was built for personal home use.
-
-> *Privacy Note:* The IP address shown on the OLED screen (e.g., 192.168.x.x) is a local network address and is not accessible from the outside internet.
+> The dashboard screenshot was translated to English for this README. The actual device interface uses Russian, as it was built for personal home use.
 
 ---
 
-## 🔧 Hardware
+## System Architecture
 
-| Component | Model | Connection |
-|-----------|-------|------------|
-| Microcontroller | ESP32 DevKit V1 | — |
-| Sensor | DHT22 (AM2302) | GPIO 14 |
-| Display | 0.96" OLED SSD1306 (128×64) | I2C (SDA: 21, SCL: 22) |
-
-### ⚠️ Calibration Note
-
-This project is designed as an "All-In-One" box solution. Due to the heat generated by the ESP32 chip inside the enclosure, the DHT22 readings are affected. 
-
-**Software calibration is applied in `SensorManager.cpp`:**
-- **Temperature:** `-2.0°C` offset (compensates for self-heating).
-- **Humidity:** `+10.9%` offset (linear correction).
-
-> *If you build this with the sensor placed outside the case, you should reset these offsets in `Settings.h` to 0.*
-
----
-
-## 🛠️ Installation
-
-### Prerequisites
-- [PlatformIO](https://platformio.org/install) (VS Code extension recommended)
-- ESP32 Development Board
-
-### Setup Steps
-
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/SmartRoomMonitor.git
-   cd SmartRoomMonitor
-   ```
-
-2. **Configure Settings**
-   The project requires a `Settings.h` file which contains your private credentials (WiFi, Tokens). 
-   Use the provided template:
-   
-   ```bash
-   # Copy the template
-   cp include/SettingsTemplate.h include/Settings.h
-   ```
-
-3. **Edit `include/Settings.h`**
-   Open the file and fill in your details:
-   - `WIFI_SSID` / `WIFI_PASS`: Your network credentials.
-   - `BOT_TOKEN`: Telegram bot token from @BotFather.
-   - `OWNER_CHAT_ID`: Your Telegram User ID (get it from @userinfobot).
-   - `WEATHER_API_URL`: Update coordinates for your city (default: Weiden, Germany).
-
-4. **Build & Upload**
-   Connect your ESP32 and run:
-   ```bash
-   pio run --target upload
-   ```
-
----
-
-## 🧠 How It Works: The Smart State Machine
-
-The core logic uses a 4-state machine to manage ventilation cycles effectively:
-
-```mermaid
-graph TD
-    A[STABLE] -- "Temp Drop > 0.5°C\nOR Hum Drop > 3%" --> B[VENTILATING]
-    B -- "Target Reached\nAbsHum <= Goal" --> C[TARGET_MET]
-    B -- "Efficiency Drop\nAvg Slope > -0.15" --> D[INEFFICIENT]
-    C -- "Window Closed\n(Rebound Detected)" --> A
-    D -- "Window Closed\n(Rebound Detected)" --> A
+```
+                          ┌─────────────────────────────────────┐
+                          │           Main Loop (Core 0)        │
+                          │  - Telegram polling                 │
+                          │  - Display refresh                  │
+                          │  - Weather API updates              │
+                          │  - Connectivity watchdog            │
+                          └──────────────┬──────────────────────┘
+                                         │
+              ┌──────────────────────────┼──────────────────────────┐
+              │                          │                          │
+              ▼                          ▼                          ▼
+   ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
+   │  WebManager     │       │  SensorManager  │       │ TelegramManager │
+   │  (Async HTTP)   │◄─────►│  (State Machine)│◄─────►│  (Alerts)       │
+   └─────────────────┘       └────────┬────────┘       └─────────────────┘
+                                      │
+                                      │ Mutex-protected access
+                                      ▼
+                          ┌─────────────────────────┐
+                          │   Sensor Task (Core 1)  │
+                          │   - DHT22 reading       │
+                          │   - Calibration         │
+                          │   - EMA filtering       │
+                          │   - State transitions   │
+                          └─────────────────────────┘
 ```
 
-1. **STABLE**: Monitors climate every 2 minutes. Saves energy.
-2. **VENTILATING**: High-frequency polling (6s). Tracks moisture removal.
-3. **TARGET_MET**: Signal to close window (Goal reached).
-4. **INEFFICIENT**: Signal to close window (Ventilation no longer effective, e.g., raining outside).
+---
+
+## State Machine Logic
+
+The ventilation detection uses a 4-state model based on Absolute Humidity dynamics:
+
+| State | Trigger | Behavior |
+|-------|---------|----------|
+| **STABLE** | Default / Window closed | Low-frequency logging (3 min), baseline tracking |
+| **VENTILATING** | Humidity drop >3% or Temp drop >0.5°C | High-frequency logging (30s), slope monitoring |
+| **TARGET_MET** | AbsHum reaches adaptive goal | Notification sent, awaiting window close |
+| **INEFFICIENT** | Slope > -0.15 g/m³ over 3 min (plateau) | Notification sent, ventilation no longer effective |
+
+Transitions back to STABLE occur on **rebound detection** (temperature trend reversal) or 1-hour timeout.
 
 ---
 
-## 📁 Project Structure
+## Hardware
+
+| Component | Specification |
+|-----------|---------------|
+| MCU | ESP32-WROOM-32 (Dual-core, 240 MHz, reduced to 80 MHz for thermal stability) |
+| Sensor | DHT22 / AM2302 (GPIO 14) |
+| Display | SSD1306 OLED 128×64 (I2C: SDA 21, SCL 22) |
+
+### Calibration Note
+
+The sensor is mounted inside an enclosed case alongside the ESP32. Chip self-heating affects readings, compensated via software offsets:
+- Temperature: **−2.0°C**
+- Humidity: **+10.9%**
+
+These values are specific to this build. External sensor mounting would require recalibration.
+
+---
+
+## Project Structure
 
 ```
 SmartRoomMonitor/
-├── docs/                    # Documentation assets & images
-├── include/                 # Header files
-│   ├── ClimateMath.h        # Physics calculations (Dew Point, Abs Humidity)
-│   ├── DisplayManager.h     # OLED UI interface
-│   ├── SensorManager.h      # Core logic & State Machine
-│   ├── SettingsTemplate.h   # 📝 Template for your credentials (WiFi, Keys)
-│   ├── TelegramManager.h    # Bot communication
-│   ├── WeatherManager.h     # Open-Meteo API integration
-│   └── WebManager.h         # Async Web Server & JSON API
-├── src/                     # Source Code (.cpp implementation)
-│   ├── main.cpp             # Setup & Loop orchestration
-│   └── ...                  # Implementation of managers
-├── documentation.md         # Full Technical Documentation (English)
-├── documentation_ru.md      # Full Technical Documentation (Russian)
-├── platformio.ini           # Project build configuration
-└── README.md                # This file
+├── include/
+│   ├── ClimateMath.h         # Dew point & absolute humidity formulas
+│   ├── SensorManager.h       # State machine, history buffer, mutex
+│   ├── DisplayManager.h      # OLED rendering with night mode
+│   ├── WebManager.h          # Async server, API endpoints
+│   ├── WeatherManager.h      # Open-Meteo integration
+│   ├── TelegramManager.h     # Bot commands, subscriber list
+│   └── SettingsTemplate.h    # Configuration template (credentials)
+├── src/
+│   ├── main.cpp              # Initialization, main loop, connectivity
+│   ├── SensorManager.cpp     # Core logic implementation
+│   ├── DisplayManager.cpp    # UI rendering
+│   ├── WebManager.cpp        # HTTP handlers, chunked streaming
+│   ├── WeatherManager.cpp    # API requests
+│   └── TelegramManager.cpp   # Notification logic
+├── docs/
+│   └── images/               # Screenshots
+├── documentation.md          # Technical documentation (English)
+├── documentation_ru.md       # Technical documentation (Russian)
+└── platformio.ini            # Build configuration
 ```
 
 ---
 
-## 📖 Documentation
+## Installation
 
-For a deep dive into the code, thread safety, and logic explanation:
-
-- 🇬🇧 **[English Documentation](documentation.md)**
-- 🇷🇺 **[Russian Documentation (Original)](documentation_ru.md)**
-
----
-
-## 📡 API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Main Dashboard (HTML) |
-| `/api/status` | GET | Current live readings & advice (JSON) |
-| `/api/history` | GET | Full history buffer (Chunked JSON Stream) |
+1. Clone repository
+2. Copy `include/SettingsTemplate.h` to `include/Settings.h`
+3. Fill in WiFi credentials, Telegram bot token, and location coordinates
+4. Build and upload via PlatformIO: `pio run --target upload`
 
 ---
 
-## 📦 Dependencies
+## API Reference
 
-- **Adafruit SSD1306 & GFX** (Display)
-- **DHT Sensor Library** (Sensors)
-- **ArduinoJson** (Data serialization)
-- **ESPAsyncWebServer** & **AsyncTCP** (Web Interface)
-- **UniversalTelegramBot** (Notifications)
+| Endpoint | Method | Response |
+|----------|--------|----------|
+| `/` | GET | HTML dashboard with live charts |
+| `/api/status` | GET | JSON: current readings, advice, debug info |
+| `/api/history` | GET | JSON array: timestamped history (chunked stream) |
 
 ---
 
-## 📄 License
+## Dependencies
 
-This project is open source and available under the [MIT License](LICENSE).
+- Adafruit SSD1306 / GFX
+- DHT sensor library
+- ArduinoJson
+- ESPAsyncWebServer + AsyncTCP
+- UniversalTelegramBot
+
+---
+
+## Documentation
+
+Detailed technical documentation covering code structure, algorithms, and design decisions:
+
+- [English version](documentation.md)
+- [Russian version (original)](documentation_ru.md)
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) file.
