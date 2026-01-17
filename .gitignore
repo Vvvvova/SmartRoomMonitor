@@ -1,0 +1,16 @@
+# PlatformIO build artifacts
+.pio
+
+# VSCode settings and cache
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch
+
+# IMPORTANT: Credentials file (contains WiFi password, Telegram token, etc.)
+# Copy Settings.h.example to Settings.h and add your credentials there
+include/Settings.h
+
+# OS generated files
+.DS_Store
+Thumbs.db
