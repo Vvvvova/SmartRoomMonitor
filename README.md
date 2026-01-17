@@ -1,8 +1,9 @@
 # 🏠 SmartRoomMonitor (ACM-1)
 
-**An intelligent ESP32-based climate monitor with smart ventilation detection, mold risk alerts, and Telegram integration.**
-
+![Maintenance](https://img.shields.io/badge/Maintenance-No-red.svg)
 [![Platform](https://img.shields.io/badge/Platform-ESP32-blue.svg)](https://www.espressif.com/en/products/socs/esp32)
+[![Framework](https://img.shields.io/badge/Framework-Arduino-00979D.svg)](https://www.arduino.cc/)
+
 [![Framework](https://img.shields.io/badge/Framework-Arduino-00979D.svg)](https://www.arduino.cc/)
 [![PlatformIO](https://img.shields.io/badge/Build%20System-PlatformIO-orange.svg)](https://platformio.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
