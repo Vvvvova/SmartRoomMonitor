@@ -124,7 +124,7 @@ Transitions back to STABLE occur on **rebound detection** (temperature trend rev
 
 ### Design Note: Sensor Calibration
 
-The enclosure design places the ESP32, OLED display, and DHT22 sensor in a compact phone-sized box. The display is mounted on the lid (visible through a cutout), while the sensor was originally intended to protrude from the top like an antenna.
+The enclosure is a compact box housing the ESP32, OLED display, and DHT22 sensor. The display is mounted on the lid (visible through a cutout), while the sensor was originally intended to protrude from the top like an antenna.
 
 **Problem discovered during testing:** The ESP32 generates heat during operation, which significantly affected temperature readings when the sensor was inside the case. This thermal coupling issue was not anticipated during the initial design phase.
 
