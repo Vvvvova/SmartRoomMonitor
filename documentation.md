@@ -550,7 +550,7 @@ The project uses the following libraries:
 
 #### Architecture Improvements:
 - **Dedicated Task:** DHT22 reading moved to separate FreeRTOS task (`sensorTask`), pinned to Core 1. This guarantees exact reading intervals (6.0 sec) regardless of web server load.
-- **Stack Tuning:** Increased stack size for `loopTask` (to 16KB) and `sensorTask` (to 6KB) for safe JSON handling.
+- **Stack Tuning:** Increased stack size for `loopTask` (to 16KB) and `sensorTask` (to 10KB) for safe JSON handling.
 
 ---
 

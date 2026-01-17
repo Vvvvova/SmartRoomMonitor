@@ -58,33 +58,44 @@ The system was developed for personal use (interface in Russian) and serves as a
 
 ## System Architecture
 
+The firmware runs on ESP32's dual-core processor with FreeRTOS:
+
 ```
-                          ┌─────────────────────────────────────┐
-                          │           Main Loop (Core 0)        │
-                          │  - Telegram polling                 │
-                          │  - Display refresh                  │
-                          │  - Weather API updates              │
-                          │  - Connectivity watchdog            │
-                          └──────────────┬──────────────────────┘
-                                         │
-              ┌──────────────────────────┼──────────────────────────┐
-              │                          │                          │
-              ▼                          ▼                          ▼
-   ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
-   │  WebManager     │       │  SensorManager  │       │ TelegramManager │
-   │  (Async HTTP)   │◄─────►│  (State Machine)│◄─────►│  (Alerts)       │
-   └─────────────────┘       └────────┬────────┘       └─────────────────┘
-                                      │
-                                      │ Mutex-protected access
-                                      ▼
-                          ┌─────────────────────────┐
-                          │   Sensor Task (Core 1)  │
-                          │   - DHT22 reading       │
-                          │   - Calibration         │
-                          │   - EMA filtering       │
-                          │   - State transitions   │
-                          └─────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│                              ESP32 Dual-Core                              │
+├───────────────────────────────────┬───────────────────────────────────────┤
+│          CORE 0 (PRO_CPU)         │          CORE 1 (APP_CPU)             │
+│      Protocol & System Tasks      │        Application Tasks              │
+├───────────────────────────────────┼───────────────────────────────────────┤
+│  • WiFi driver                    │  • Arduino loop()                     │
+│  • TCP/IP stack                   │    - Telegram polling                 │
+│  • AsyncTCP (WebServer backend)   │    - Display updates                  │
+│  • NTP client                     │    - Weather API calls                │
+│  • System watchdog                │    - Connectivity checks              │
+│                                   │                                       │
+│                                   │  • sensorTask (FreeRTOS)              │
+│                                   │    - DHT22 reading (6s interval)      │
+│                                   │    - Calibration & EMA filtering      │
+│                                   │    - State machine transitions        │
+│                                   │    - History logging                  │
+└───────────────────────────────────┴───────────────────────────────────────┘
+                                    │
+                    ┌───────────────┴───────────────┐
+                    │       Shared Resources        │
+                    │    (Mutex-protected access)   │
+                    ├───────────────────────────────┤
+                    │  • History buffer [500]       │
+                    │  • Current readings (T/H/DP)  │
+                    │  • Climate state              │
+                    │  • Advice cache               │
+                    └───────────────────────────────┘
 ```
+
+**Data Flow:**
+1. `sensorTask` reads DHT22 every 6 seconds, processes data, updates state machine
+2. `loop()` periodically logs history, updates display, polls Telegram
+3. `WebManager` (AsyncTCP) serves HTTP requests, reads shared data via mutex
+4. All modules access `SensorManager` data through thread-safe getters
 
 ---
 
@@ -111,13 +122,19 @@ Transitions back to STABLE occur on **rebound detection** (temperature trend rev
 | Sensor | DHT22 / AM2302 (GPIO 14) |
 | Display | SSD1306 OLED 128×64 (I2C: SDA 21, SCL 22) |
 
-### Calibration Note
+### Design Note: Sensor Calibration
 
-The sensor is mounted inside an enclosed case alongside the ESP32. Chip self-heating affects readings, compensated via software offsets:
+The enclosure design places the ESP32, OLED display, and DHT22 sensor in a compact phone-sized box. The display is mounted on the lid (visible through a cutout), while the sensor was originally intended to protrude from the top like an antenna.
+
+**Problem discovered during testing:** The ESP32 generates heat during operation, which significantly affected temperature readings when the sensor was inside the case. This thermal coupling issue was not anticipated during the initial design phase.
+
+**Solution (hardware):** The sensor was pulled out as far as mechanically possible. In the final build, only ~1 cm of the sensor leads (with soldered wires) remain visible through the top opening. The sensor body now sits partially outside the enclosure.
+
+**Solution (software):** Residual thermal offset is compensated via calibration constants:
 - Temperature: **−2.0°C**
 - Humidity: **+10.9%**
 
-These values are specific to this build. External sensor mounting would require recalibration.
+This was a first-iteration prototype with no resources for a complete redesign. The software calibration made it functional despite the hardware constraints.
 
 ---
 
