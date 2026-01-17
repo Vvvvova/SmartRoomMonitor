@@ -29,7 +29,9 @@
 |:-------------:|:------------:|:------------:|
 | ![Dashboard](docs/images/dashboard.png) | ![OLED](docs/images/oled.png) | ![Telegram](docs/images/telegram.png) |
 
-> *Note on privacy: The IP address shown on the OLED screen (e.g., 192.168.x.x) is a local network address and is not accessible from the outside internet.*
+> *Note:* The web dashboard screenshot above was translated to English for demonstration purposes. The actual device interface and Telegram bot use **Russian language**, as this system was built for personal home use.
+
+> *Privacy Note:* The IP address shown on the OLED screen (e.g., 192.168.x.x) is a local network address and is not accessible from the outside internet.
 
 ---
 
