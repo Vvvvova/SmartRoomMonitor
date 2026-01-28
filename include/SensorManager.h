@@ -76,6 +76,11 @@ public:
   float getDryingRate() const;       // Returns g/m³/min during ventilation
   String getDryingIndicator() const; // Returns ▲▲, ▲, ▼, or - based on rate
 
+  // Unified Status Display v3.3
+  unsigned long getStateDurationMinutes() const; // Minutes since state entered
+  void getUnifiedStatus(char *buffer,
+                        size_t bufferSize) const; // Memory-safe status string
+
   // Thread Safety
   void lock();
   void unlock();

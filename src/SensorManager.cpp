@@ -739,6 +739,63 @@ String SensorManager::getDryingIndicator() const {
   }
 }
 
+// --- UNIFIED STATUS DISPLAY v3.3 ---
+unsigned long SensorManager::getStateDurationMinutes() const {
+  return (millis() - stateEnterTime) / 60000;
+}
+
+void SensorManager::getUnifiedStatus(char *buffer, size_t bufferSize) const {
+  if (bufferSize < 64) {
+    buffer[0] = '\0';
+    return;
+  }
+
+  unsigned long minutes = getStateDurationMinutes();
+
+  switch (state) {
+  case ClimateState::STABLE:
+    // No timer/indicator for stable state - just show regular advice
+    snprintf(buffer, bufferSize, "Стабильно");
+    break;
+
+  case ClimateState::VENTILATING: {
+    // "Сушка (5 мин) ▲▲"
+    float rate = getDryingRate();
+    const char *indicator;
+    if (rate >= RATE_EXCELLENT) {
+      indicator = "▲▲";
+    } else if (rate >= RATE_GOOD) {
+      indicator = "▲";
+    } else if (rate > 0) {
+      indicator = "▼";
+    } else {
+      indicator = ""; // Not enough data yet
+    }
+
+    if (minutes < 1) {
+      snprintf(buffer, bufferSize, "Сушка... %s", indicator);
+    } else {
+      snprintf(buffer, bufferSize, "Сушка (%lu мин) %s", minutes, indicator);
+    }
+    break;
+  }
+
+  case ClimateState::TARGET_MET:
+    // "Готово (за 12 мин) Закрывай"
+    snprintf(buffer, bufferSize, "Готово (за %lu мин) Закрывай", minutes);
+    break;
+
+  case ClimateState::INEFFICIENT:
+    // "Эффект упал (25 мин). Закрывай"
+    snprintf(buffer, bufferSize, "Эффект упал (%lu мин). Закрывай", minutes);
+    break;
+
+  default:
+    snprintf(buffer, bufferSize, "???");
+    break;
+  }
+}
+
 void SensorManager::setWeatherManager(WeatherManager *wm) {
   this->weather = wm;
 }
