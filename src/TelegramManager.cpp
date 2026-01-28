@@ -42,7 +42,7 @@ void TelegramManager::update() {
     
     // A. Transition to TARGET_MET (Success)
     if (lastClimateState == SensorManager::ClimateState::VENTILATING && currentState == SensorManager::ClimateState::TARGET_MET) {
-        String msg = "✅ **Цель достигнута (50%)**\nВлажность в норме. Можно закрывать.";
+        String msg = "✅ **Цель достигнута!**\nВлажность в норме. Можно закрывать.";
         broadcastAlert(msg, 1);
     }
 

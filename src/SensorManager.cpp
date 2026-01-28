@@ -144,7 +144,7 @@ void SensorManager::updateAdvice() {
     }
     else if (state == ClimateState::VENTILATING) {
         // Physics-based advice
-        s = "Сушка... [dAbs=" + String(lastAbsHum - currentAbsHum, 2) + "]";
+        s = "Сушка (Идет активное проветривание)";
         code = 1; // Yellow
     }
     else {
