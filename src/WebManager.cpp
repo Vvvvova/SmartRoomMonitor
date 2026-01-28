@@ -187,10 +187,15 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <div class="debug-item">Средняя Влажность (24ч): <span id="dbg-avg">--</span>%</div>
                 <div class="debug-item">Абс. Влажность (Дома): <span id="dbg-in-abs">--</span> г/м³</div>
                 <hr style="grid-column: span 2; border: 0; border-top: 1px solid #333; width: 100%;">
+                <div class="debug-item">Heap Free: <span id="dbg-heap-free">--</span> KB</div>
+                <div class="debug-item">Heap Min: <span id="dbg-heap-min">--</span> KB</div>
+                <hr style="grid-column: span 2; border: 0; border-top: 1px solid #333; width: 100%;">
                 <div class="debug-item">Погода (Weiden): <span id="dbg-weather-status">--</span></div>
                 <div class="debug-item">Уличная Температура: <span id="dbg-out-t">--</span>°C</div>
                 <div class="debug-item">Уличная Влажность: <span id="dbg-out-h">--</span>%</div>
                 <div class="debug-item">Абс. Влажность (Улица): <span id="dbg-out-abs">--</span> г/м³</div>
+                <hr style="grid-column: span 2; border: 0; border-top: 1px solid #333; width: 100%;">
+                <div class="debug-item">Скорость сушки: <span id="dbg-drying-rate">--</span> г/м³/мин <span id="dbg-drying-ind">-</span></div>
             </div>
         </details>
     </div>
@@ -272,12 +277,17 @@ const char index_html[] PROGMEM = R"rawliteral(
                 // Debug
                 document.getElementById('dbg-avg').innerText = data.debug.avg.toFixed(1);
                 document.getElementById('dbg-in-abs').innerText = data.debug.in_abs.toFixed(2);
+                document.getElementById('dbg-heap-free').innerText = (data.debug.heap_free / 1024).toFixed(1);
+                document.getElementById('dbg-heap-min').innerText = (data.debug.heap_min / 1024).toFixed(1);
                 document.getElementById('dbg-weather-status').innerText = data.debug.status;
                 if(data.debug.valid) {
                     document.getElementById('dbg-out-t').innerText = data.debug.out_t.toFixed(1);
                     document.getElementById('dbg-out-h').innerText = data.debug.out_h.toFixed(1);
                     document.getElementById('dbg-out-abs').innerText = data.debug.out_abs.toFixed(2);
                 }
+                // Drying Speedometer v3.3
+                document.getElementById('dbg-drying-rate').innerText = data.debug.drying_rate.toFixed(3);
+                document.getElementById('dbg-drying-ind').innerText = data.debug.drying_ind;
             } catch (e) {
                 console.error("Status Sync Error", e);
             }
@@ -321,131 +331,144 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-WebManager::WebManager(SensorManager* sm) : server(80), sensorManager(sm) {}
+WebManager::WebManager(SensorManager *sm) : server(80), sensorManager(sm) {}
 
 void WebManager::begin() {
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", index_html);
-    });
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", index_html);
+  });
 
-    // 1. LIGHTWEIGHT STATUS API (Calling every 3s)
-    server.on("/api/status", HTTP_GET, [this](AsyncWebServerRequest *request){
-        AsyncResponseStream *response = request->beginResponseStream("application/json");
-        StaticJsonDocument<512> doc; // Static allocation - no heap fragmentation
+  // 1. LIGHTWEIGHT STATUS API (Calling every 3s)
+  server.on("/api/status", HTTP_GET, [this](AsyncWebServerRequest *request) {
+    AsyncResponseStream *response =
+        request->beginResponseStream("application/json");
+    StaticJsonDocument<640> doc; // Static allocation - no heap fragmentation
 
-        float t = sensorManager->getTemp();
-        float h = sensorManager->getHum();
-        
-        doc["t"] = isnan(t) ? 0 : t;
-        doc["h"] = isnan(h) ? 0 : h;
-        doc["dp"] = sensorManager->getDewPoint();
-        doc["advice"] = sensorManager->getRecommendation();
-        doc["code"] = sensorManager->getAdviceCode();
-        
-        // Debug
-        JsonObject dbg = doc.createNestedObject("debug");
-        dbg["avg"] = sensorManager->getAvg24h();
-        dbg["in_abs"] = sensorManager->getIndoorAbsHum();
-        dbg["valid"] = sensorManager->isWeatherValid();
-        dbg["status"] = sensorManager->getWeatherStatus();
-        dbg["out_t"] = sensorManager->getOutdoorTemp();
-        dbg["out_h"] = sensorManager->getOutdoorHum();
-        dbg["out_abs"] = sensorManager->getOutdoorAbsHum();
-        
-        serializeJson(doc, *response);
-        request->send(response);
-    });
+    float t = sensorManager->getTemp();
+    float h = sensorManager->getHum();
 
-    // 2. HEAVY HISTORY API (Chunked Streaming - Zero RAM Allocation)
-    server.on("/api/history", HTTP_GET, [this](AsyncWebServerRequest *request){
-        // State for the chunker (Captured by value in lambda)
-        // We use a safe batch size to prevent WDT and Stack Overflow
-        struct ChunkerState {
-            size_t offset = 0;
-            bool finalized = false;
-        };
-        auto state = std::make_shared<ChunkerState>();
-        
-        request->send(request->beginChunkedResponse("application/json",
-            [this, state](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-                // Returns 0 to signal end of stream
-                if (state->finalized) return 0;
+    doc["t"] = isnan(t) ? 0 : t;
+    doc["h"] = isnan(h) ? 0 : h;
+    doc["dp"] = sensorManager->getDewPoint();
+    doc["advice"] = sensorManager->getRecommendation();
+    doc["code"] = sensorManager->getAdviceCode();
 
-                // CRITICAL: Yield to allow WiFi and Watchdog to breathe
-                // This prevents "Interrupt Watchdog" resets during slow transfers
-                vTaskDelay(1); 
-                #if defined(ESP32) && defined(CONFIG_ESP32_WDT)
-                esp_task_wdt_reset();
-                #endif
+    // Debug
+    JsonObject dbg = doc.createNestedObject("debug");
+    dbg["avg"] = sensorManager->getAvg24h();
+    dbg["in_abs"] = sensorManager->getIndoorAbsHum();
+    dbg["heap_free"] = ESP.getFreeHeap();
+    dbg["heap_min"] = ESP.getMinFreeHeap();
+    dbg["valid"] = sensorManager->isWeatherValid();
+    dbg["status"] = sensorManager->getWeatherStatus();
+    dbg["out_t"] = sensorManager->getOutdoorTemp();
+    dbg["out_h"] = sensorManager->getOutdoorHum();
+    dbg["out_abs"] = sensorManager->getOutdoorAbsHum();
+    dbg["drying_rate"] = sensorManager->getDryingRate();
+    dbg["drying_ind"] = sensorManager->getDryingIndicator();
 
-                size_t used = 0;
-                
-                // 1. Start Array
-                if (state->offset == 0) {
-                    if (maxLen > used) buffer[used++] = '[';
-                }
-                
-                // 2. Determine Batch Size
-                // We need enough space for at least one JSON object (~60 bytes)
-                // If buffer is tiny, wait for next chunk
-                if (maxLen - used < 64) return used;
+    serializeJson(doc, *response);
+    request->send(response);
+  });
 
-                // Max items that fit in buffer (conservative estimate)
-                size_t maxItems = (maxLen - used) / 64;
-                // Cap at 32 to ensure we yield frequent enough (approx every 10-20ms)
-                size_t batchLimit = (maxItems > 32) ? 32 : maxItems;
-                
-                if (batchLimit == 0) return used; // Should not happen given check above, but safety first
+  // 2. HEAVY HISTORY API (Chunked Streaming - Zero RAM Allocation)
+  server.on("/api/history", HTTP_GET, [this](AsyncWebServerRequest *request) {
+    // State for the chunker (Captured by value in lambda)
+    // We use a safe batch size to prevent WDT and Stack Overflow
+    struct ChunkerState {
+      size_t offset = 0;
+      bool finalized = false;
+    };
+    auto state = std::make_shared<ChunkerState>();
 
-                Record batch[32]; 
-                
-                // 3. Fetch Batch (Thread Safe Copy)
-                size_t count = sensorManager->copyHistory(state->offset, batchLimit, batch);
-                
-                // 4. Serialize Batch
-                for (size_t i = 0; i < count; i++) {
-                    // Check remaining space before writing
-                    size_t remaining = maxLen - used;
-                    if (remaining < 64) break; // Not enough space, continue in next chunk
-                    
-                    // Add comma if this is NOT the very first item
-                    if (state->offset > 0 || i > 0) {
-                        buffer[used++] = ',';
-                        remaining--;
-                    }
-                    
-                    // Format: {"t":22.5,"h":45.0,"time":1700000000}
-                    int written = snprintf((char*)(buffer + used), remaining, 
-                        "{\"t\":%.1f,\"h\":%.1f,\"time\":%lu}", 
-                        isnan(batch[i].t) ? 0.0f : batch[i].t, 
-                        isnan(batch[i].h) ? 0.0f : batch[i].h, 
-                        (unsigned long)batch[i].ts);
-                    
-                    // FIX: Proper snprintf overflow check
-                    if (written > 0 && written < (int)remaining) {
-                        used += written;
-                    } else {
-                        // Truncation occurred or error, stop this batch
-                        break;
-                    }
-                }
-                
-                state->offset += count;
+    request->send(request->beginChunkedResponse(
+        "application/json",
+        [this, state](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+          // Returns 0 to signal end of stream
+          if (state->finalized)
+            return 0;
 
-                // 5. Finalize if Done
-                if (count == 0) {
-                    // We asked for data but got 0 -> End of Buffer
-                    if (maxLen - used >= 1) {
-                         buffer[used++] = ']';
-                         state->finalized = true;
-                    }
-                    // if no space for ']', we return 'used'. Next call, count will be 0 again, and we try ']' again.
-                }
+          // CRITICAL: Yield to allow WiFi and Watchdog to breathe
+          // This prevents "Interrupt Watchdog" resets during slow transfers
+          vTaskDelay(1);
+#if defined(ESP32) && defined(CONFIG_ESP32_WDT)
+          esp_task_wdt_reset();
+#endif
 
-                return used;
+          size_t used = 0;
+
+          // 1. Start Array
+          if (state->offset == 0) {
+            if (maxLen > used)
+              buffer[used++] = '[';
+          }
+
+          // 2. Determine Batch Size
+          // We need enough space for at least one JSON object (~60 bytes)
+          // If buffer is tiny, wait for next chunk
+          if (maxLen - used < 64)
+            return used;
+
+          // Max items that fit in buffer (conservative estimate)
+          size_t maxItems = (maxLen - used) / 64;
+          // Cap at 32 to ensure we yield frequent enough (approx every 10-20ms)
+          size_t batchLimit = (maxItems > 32) ? 32 : maxItems;
+
+          if (batchLimit == 0)
+            return used; // Should not happen given check above, but safety
+                         // first
+
+          Record batch[32];
+
+          // 3. Fetch Batch (Thread Safe Copy)
+          size_t count =
+              sensorManager->copyHistory(state->offset, batchLimit, batch);
+
+          // 4. Serialize Batch
+          for (size_t i = 0; i < count; i++) {
+            // Check remaining space before writing
+            size_t remaining = maxLen - used;
+            if (remaining < 64)
+              break; // Not enough space, continue in next chunk
+
+            // Add comma if this is NOT the very first item
+            if (state->offset > 0 || i > 0) {
+              buffer[used++] = ',';
+              remaining--;
             }
-        ));
-    });
 
-    server.begin();
+            // Format: {"t":22.5,"h":45.0,"time":1700000000}
+            int written = snprintf((char *)(buffer + used), remaining,
+                                   "{\"t\":%.1f,\"h\":%.1f,\"time\":%lu}",
+                                   isnan(batch[i].t) ? 0.0f : batch[i].t,
+                                   isnan(batch[i].h) ? 0.0f : batch[i].h,
+                                   (unsigned long)batch[i].ts);
+
+            // FIX: Proper snprintf overflow check
+            if (written > 0 && written < (int)remaining) {
+              used += written;
+            } else {
+              // Truncation occurred or error, stop this batch
+              break;
+            }
+          }
+
+          state->offset += count;
+
+          // 5. Finalize if Done
+          if (count == 0) {
+            // We asked for data but got 0 -> End of Buffer
+            if (maxLen - used >= 1) {
+              buffer[used++] = ']';
+              state->finalized = true;
+            }
+            // if no space for ']', we return 'used'. Next call, count will be 0
+            // again, and we try ']' again.
+          }
+
+          return used;
+        }));
+  });
+
+  server.begin();
 }
