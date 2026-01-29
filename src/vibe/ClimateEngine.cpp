@@ -242,6 +242,12 @@ ClimateEngine::computeTransition(const StateInput& in) {
         out.newBaseHum = in.hum;
         out.newBaseAbsHum = in.absHum;
         out.newTriggerCount = 0;
+        
+        // Reset Rebound Tracking (CRITICAL FIX)
+        out.newReboundStartTemp = NAN; // Start fresh
+        out.newReboundMinAbsHum = NAN; // Start fresh
+        out.newReboundStartTime = 0;
+        
         out.transitionReason = "STABLE -> VENTILATING (Trigger)";
       }
     } else {
@@ -307,7 +313,8 @@ ClimateEngine::computeTransition(const StateInput& in) {
     }
 
     // 2. SHARED REBOUND: Check for window close in any active mode
-    if (out.newState != ClimateState::STABLE) {
+    // BLIND WINDOW: Ignore rebound logic for first 60 seconds to allow sensor to stabilize drop
+    if (out.newState != ClimateState::STABLE && timeSinceStateEnter > 60000) {
       // Temperature Trough Tracking
       if (isnan(in.reboundStartTemp) || in.temp < in.reboundStartTemp) {
           out.newReboundStartTemp = in.temp;
