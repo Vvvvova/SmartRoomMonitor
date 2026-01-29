@@ -149,7 +149,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         <!-- ADVICE BOX -->
         <div class="advice-box" id="advice-box">
             <div>
-                <div class="advice-label" id="unified-status" style="font-size: 1.1rem; margin-bottom: 4px;">--</div>
+                <div class="advice-label">СОВЕТ СИСТЕМЫ</div>
                 <div class="advice-text" id="advice-text">Загрузка...</div>
             </div>
             <div style="font-size: 2rem;">💡</div>
@@ -270,7 +270,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                 
                 // Advice
                 document.getElementById('advice-text').innerText = data.advice;
-                document.getElementById('unified-status').innerText = data.unified_status;
                 
                 const code = data.code;
                 document.getElementById('advice-box').className = 'advice-box status-' + code;
@@ -367,11 +366,6 @@ void WebManager::begin() {
     dbg["out_abs"] = sensorManager->getOutdoorAbsHum();
     dbg["drying_rate"] = sensorManager->getDryingRate();
     dbg["drying_ind"] = sensorManager->getDryingIndicator();
-
-    // Unified Status v3.3 (uses fixed buffer - no heap allocation)
-    char unifiedBuf[64];
-    sensorManager->getUnifiedStatus(unifiedBuf, sizeof(unifiedBuf));
-    doc["unified_status"] = unifiedBuf;
 
     serializeJson(doc, *response);
     request->send(response);

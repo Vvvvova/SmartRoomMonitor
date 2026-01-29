@@ -114,7 +114,7 @@ void setup() {
   telegramManager.begin();
   String reason = getResetReason();
   String startupMsg = "🟢 **Система Запущена**\n";
-  startupMsg += "Версия: v3.3 (Smart Triggers)\n";
+  startupMsg += "Версия: v3.4 (Fast Triggers + Timer)\n";
   startupMsg += "Причина: " + reason + "\n";
   startupMsg += "Heap: " + String(ESP.getFreeHeap() / 1024) + " KB";
   telegramManager.broadcastAlert(startupMsg, 1);

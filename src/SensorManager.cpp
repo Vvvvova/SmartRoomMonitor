@@ -1,6 +1,18 @@
+#ifdef UNIT_TEST
+#include "MockArduino.h"
+#include "SensorManager.h"
+#else
 #include "SensorManager.h"
 #include "ClimateMath.h"
 #include "WeatherManager.h"
+#endif
+
+#ifdef UNIT_TEST
+MockSerial Serial;
+float DHT::_temp = NAN;
+float DHT::_hum = NAN;
+unsigned long _mock_millis = 0;
+#endif
 
 SensorManager::SensorManager()
     : dht(DHTPIN, DHTTYPE), currentTemp(NAN), currentHum(NAN), currentDP(NAN),
@@ -11,7 +23,7 @@ SensorManager::SensorManager()
       cachedAdvice("Загрузка..."), cachedCode(0), lastAdviceUpdate(0),
       // FIX: Initialize all physics tracking variables to NAN
       lastAbsHumForWindowCheck(NAN), stateEnterAbsHum(NAN), lastAbsHum(NAN),
-      stateEnterHum(NAN),
+      stateEnterHum(NAN), lastHumForWindowCheck(NAN),
       // Plateau v2.0 initialization
       slopeWindowHead(0), slopeWindowCount(0), plateauConfirmCounter(0),
       baselineUpdateCounter(0),
@@ -142,14 +154,29 @@ void SensorManager::updateAdvice() {
     s = "Анализ...";
     code = 0;
   } else if (state == ClimateState::INEFFICIENT) {
-    s = "Эффективность упала. Закрыть.";
+    // FIX v3.4: Add timer to show how long window was open
+    unsigned long durMs = millis() - stateEnterTime;
+    int mins = (durMs + 59999) / 60000; // Round UP for better UX
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Эффект упал (%d мин). Закрывай", mins);
+    s = buf;
     code = 2; // Red
   } else if (state == ClimateState::TARGET_MET) {
-    s = "Цель (50%) достигнута! Можно закрыть.";
+    // FIX v3.4: Show total time it took to reach target
+    unsigned long durMs = millis() - stateEnterTime;
+    int mins = (durMs + 59999) / 60000; // Round UP for better UX
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Готово (за %d мин) Закрывай", mins);
+    s = buf;
     code = 3; // Green
   } else if (state == ClimateState::VENTILATING) {
-    // Physics-based advice
-    s = "Сушка (Идет активное проветривание)";
+    // FIX v3.4: Add timer and speedometer to drying advice
+    unsigned long durMs = millis() - stateEnterTime;
+    int mins = (durMs + 59999) / 60000; // Round UP for better UX
+    String ind = getDryingIndicator();
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Сушка (%d мин) %s", mins, ind.c_str());
+    s = buf;
     code = 1; // Yellow
   } else {
     // STABLE
@@ -358,6 +385,278 @@ Record SensorManager::getHistoryPoint(size_t index) const {
   return history[actualIndex];
 }
 
+// =============================================================================
+// STATE MACHINE v6.0 - PURE DECISION FUNCTION
+// =============================================================================
+// This function has NO side effects. It takes all inputs and returns all outputs.
+// This makes the state machine fully testable without mocking Arduino.
+//
+SensorManager::StateOutput
+SensorManager::computeTransition(const StateInput& in) {
+  StateOutput out;
+  
+  // Initialize output with current state (no change by default)
+  out.newState = in.currentState;
+  out.newStateEnterTime = in.stateEnterTime;
+  out.updateBaseline = false;
+  out.newBaseTemp = in.baseTemp;
+  out.newBaseHum = in.baseHum;
+  out.newBaseAbsHum = in.baseAbsHum;
+  out.newTriggerCount = in.triggerConfirmCount;
+  out.newPlateauCount = in.plateauConfirmCount;
+  out.newBaselineCounter = in.baselineUpdateCount;
+  out.newReboundStartTemp = in.reboundStartTemp;
+  out.newReboundStartTime = in.reboundStartTime;
+  out.newStateEnterHum = in.stateEnterHum;
+  out.newStateEnterAbsHum = in.stateEnterAbsHum;
+  out.transitionReason = nullptr;
+
+  unsigned long timeSinceStateEnter = in.now - in.stateEnterTime;
+
+  // =========================================================================
+  // 1. STABLE STATE — Monitoring for ventilation start
+  // =========================================================================
+  if (in.currentState == ClimateState::STABLE) {
+    // Reset plateau tracking (will be applied by caller)
+    out.newPlateauCount = 0;
+    out.newReboundStartTemp = NAN;
+
+    bool lockoutActive = (timeSinceStateEnter < STATE_LOCKOUT_MS);
+
+    // Trigger conditions
+    bool rapidHumDrop =
+        (!isnan(in.baseHum) &&
+         (in.baseHum - in.hum) > VENT_TRIGGER_HUM_DROP);
+    bool rapidTempDrop =
+        (!isnan(in.baseTemp) &&
+         (in.baseTemp - in.temp) > VENT_TRIGGER_TEMP_DROP);
+    bool rapidAbsHumDrop =
+        (!isnan(in.prevAbsHum) &&
+         (in.prevAbsHum - in.absHum) > VENT_TRIGGER_ABSHUM_DROP);
+
+    bool anyTrigger = (rapidHumDrop || rapidTempDrop || rapidAbsHumDrop);
+
+    if (anyTrigger && !lockoutActive) {
+      out.newTriggerCount = in.triggerConfirmCount + 1;
+      if (out.newTriggerCount >= VENT_TRIGGER_CONFIRM) {
+        // TRANSITION: STABLE -> VENTILATING
+        out.newState = ClimateState::VENTILATING;
+        out.newStateEnterTime = in.now;
+        out.newStateEnterHum = in.hum;
+        out.newStateEnterAbsHum = in.absHum;
+        out.updateBaseline = true;
+        out.newBaseTemp = in.temp;
+        out.newBaseHum = in.hum;
+        out.newBaseAbsHum = in.absHum;
+        out.newTriggerCount = 0;
+        out.newPlateauCount = 0;
+        out.newReboundStartTemp = NAN;
+        out.transitionReason = "STABLE -> VENTILATING (Smart Trigger)";
+      }
+    } else {
+      out.newTriggerCount = 0;
+    }
+
+    // Baseline update (every 50 readings)
+    out.newBaselineCounter = in.baselineUpdateCount + 1;
+    if (out.newBaselineCounter >= 50) {
+      out.newBaselineCounter = 0;
+      out.updateBaseline = true;
+      out.newBaseTemp = in.temp;
+      out.newBaseHum = in.hum;
+      out.newBaseAbsHum = in.absHum;
+    }
+  }
+
+  // =========================================================================
+  // 2. VENTILATING STATE — Active drying
+  // =========================================================================
+  else if (in.currentState == ClimateState::VENTILATING) {
+    unsigned long dur = timeSinceStateEnter;
+
+    // A. SUCCESS CONDITION
+    float targetHum = fmax(50.0f, in.stateEnterHum - 15.0f);
+    if (in.hum <= targetHum) {
+      out.newState = ClimateState::TARGET_MET;
+      out.newStateEnterTime = in.now;
+      out.updateBaseline = true;
+      out.newBaseTemp = in.temp;
+      out.newBaseHum = in.hum;
+      out.newBaseAbsHum = in.absHum;
+      out.newReboundStartTemp = NAN;
+      out.transitionReason = "VENTILATING -> TARGET_MET (Target reached)";
+    }
+    // B. PLATEAU DETECTION
+    else if (dur > 180000 && in.slopeCount >= 3) {
+      float slope = in.slopeNewest - in.slopeOldest;
+      
+      // Adaptive threshold
+      float adaptiveThreshold = PLATEAU_SLOPE_THRESHOLD;
+      if (!isnan(in.stateEnterHum)) {
+        float humFactor = fmin(fmax(in.stateEnterHum, 50.0f), 70.0f) - 50.0f;
+        adaptiveThreshold = PLATEAU_SLOPE_THRESHOLD - (humFactor * 0.003f);
+      }
+
+      if (!isnan(slope) && slope > adaptiveThreshold) {
+        out.newPlateauCount = in.plateauConfirmCount + 1;
+        if (out.newPlateauCount >= PLATEAU_CONFIRM_COUNT) {
+          out.newState = ClimateState::INEFFICIENT;
+          out.newStateEnterTime = in.now;
+          out.updateBaseline = true;
+          out.newBaseTemp = in.temp;
+          out.newBaseHum = in.hum;
+          out.newBaseAbsHum = in.absHum;
+          out.newReboundStartTemp = NAN;
+          out.transitionReason = "VENTILATING -> INEFFICIENT (Plateau)";
+        }
+      } else {
+        out.newPlateauCount = 0;
+      }
+    }
+
+    // C. REBOUND DETECTION (Window Closed)
+    if (out.newState == ClimateState::VENTILATING) { // Only if not already transitioning
+      if (!isnan(in.reboundStartTemp)) {
+        float tempRise = in.temp - in.reboundStartTemp;
+        unsigned long reboundDur = in.now - in.reboundStartTime;
+        
+        if (tempRise > REBOUND_TEMP_RISE && reboundDur > REBOUND_TIME_MS) {
+          out.newState = ClimateState::STABLE;
+          out.newStateEnterTime = in.now;
+          out.updateBaseline = true;
+          out.newBaseTemp = in.temp;
+          out.newBaseHum = in.hum;
+          out.newBaseAbsHum = in.absHum;
+          out.transitionReason = "VENTILATING -> STABLE (Temp rebound)";
+        } else if (in.temp < in.reboundStartTemp) {
+          out.newReboundStartTemp = NAN;
+        }
+      } else {
+        if (in.temp > in.baseTemp + 0.05f) {
+          out.newReboundStartTemp = in.baseTemp;
+          out.newReboundStartTime = in.now;
+        }
+      }
+
+      // Fallback: AbsHum rebound
+      if (out.newState == ClimateState::VENTILATING &&
+          (in.absHum - in.baseAbsHum) > REBOUND_ABSHUM_RISE) {
+        out.newState = ClimateState::STABLE;
+        out.newStateEnterTime = in.now;
+        out.updateBaseline = true;
+        out.newBaseTemp = in.temp;
+        out.newBaseHum = in.hum;
+        out.newBaseAbsHum = in.absHum;
+        out.transitionReason = "VENTILATING -> STABLE (AbsHum rebound)";
+      }
+    }
+  }
+
+  // =========================================================================
+  // 3. TARGET_MET — Success! Waiting for window close
+  // =========================================================================
+  else if (in.currentState == ClimateState::TARGET_MET) {
+    // Rebound detection
+    if (!isnan(in.reboundStartTemp)) {
+      float tempRise = in.temp - in.reboundStartTemp;
+      unsigned long reboundDur = in.now - in.reboundStartTime;
+      
+      if (tempRise > REBOUND_TEMP_RISE && reboundDur > REBOUND_TIME_MS) {
+        out.newState = ClimateState::STABLE;
+        out.newStateEnterTime = in.now;
+        out.updateBaseline = true;
+        out.newBaseTemp = in.temp;
+        out.newBaseHum = in.hum;
+        out.newBaseAbsHum = in.absHum;
+        out.transitionReason = "TARGET_MET -> STABLE (Rebound)";
+      } else if (in.temp < in.reboundStartTemp) {
+        out.newReboundStartTemp = NAN;
+      }
+    } else {
+      if (in.temp > in.baseTemp + 0.05f) {
+        out.newReboundStartTemp = in.baseTemp;
+        out.newReboundStartTime = in.now;
+      }
+    }
+
+    // AbsHum rebound
+    if (out.newState == ClimateState::TARGET_MET &&
+        (in.absHum - in.baseAbsHum) > REBOUND_ABSHUM_RISE) {
+      out.newState = ClimateState::STABLE;
+      out.newStateEnterTime = in.now;
+      out.updateBaseline = true;
+      out.newBaseTemp = in.temp;
+      out.newBaseHum = in.hum;
+      out.newBaseAbsHum = in.absHum;
+      out.transitionReason = "TARGET_MET -> STABLE (AbsHum rebound)";
+    }
+
+    // Timeout
+    if (out.newState == ClimateState::TARGET_MET && timeSinceStateEnter > 3600000) {
+      out.newState = ClimateState::STABLE;
+      out.newStateEnterTime = in.now;
+      out.updateBaseline = true;
+      out.newBaseTemp = in.temp;
+      out.newBaseHum = in.hum;
+      out.newBaseAbsHum = in.absHum;
+      out.transitionReason = "TARGET_MET -> STABLE (Timeout 1h)";
+    }
+  }
+
+  // =========================================================================
+  // 4. INEFFICIENT — Plateau reached, waiting for window close
+  // =========================================================================
+  else if (in.currentState == ClimateState::INEFFICIENT) {
+    // Same rebound logic as TARGET_MET
+    if (!isnan(in.reboundStartTemp)) {
+      float tempRise = in.temp - in.reboundStartTemp;
+      unsigned long reboundDur = in.now - in.reboundStartTime;
+      
+      if (tempRise > REBOUND_TEMP_RISE && reboundDur > REBOUND_TIME_MS) {
+        out.newState = ClimateState::STABLE;
+        out.newStateEnterTime = in.now;
+        out.updateBaseline = true;
+        out.newBaseTemp = in.temp;
+        out.newBaseHum = in.hum;
+        out.newBaseAbsHum = in.absHum;
+        out.transitionReason = "INEFFICIENT -> STABLE (Rebound)";
+      } else if (in.temp < in.reboundStartTemp) {
+        out.newReboundStartTemp = NAN;
+      }
+    } else {
+      if (in.temp > in.baseTemp + 0.05f) {
+        out.newReboundStartTemp = in.baseTemp;
+        out.newReboundStartTime = in.now;
+      }
+    }
+
+    // AbsHum rebound
+    if (out.newState == ClimateState::INEFFICIENT &&
+        (in.absHum - in.baseAbsHum) > REBOUND_ABSHUM_RISE) {
+      out.newState = ClimateState::STABLE;
+      out.newStateEnterTime = in.now;
+      out.updateBaseline = true;
+      out.newBaseTemp = in.temp;
+      out.newBaseHum = in.hum;
+      out.newBaseAbsHum = in.absHum;
+      out.transitionReason = "INEFFICIENT -> STABLE (AbsHum rebound)";
+    }
+
+    // Timeout
+    if (out.newState == ClimateState::INEFFICIENT && timeSinceStateEnter > 3600000) {
+      out.newState = ClimateState::STABLE;
+      out.newStateEnterTime = in.now;
+      out.updateBaseline = true;
+      out.newBaseTemp = in.temp;
+      out.newBaseHum = in.hum;
+      out.newBaseAbsHum = in.absHum;
+      out.transitionReason = "INEFFICIENT -> STABLE (Timeout 1h)";
+    }
+  }
+
+  return out;
+}
+
 void SensorManager::processReading(float rawT, float rawH) {
   float t = rawT + TEMP_OFFSET;
   float h = constrain(rawH + HUM_OFFSET, 0.0f,
@@ -380,291 +679,83 @@ void SensorManager::processReading(float rawT, float rawH) {
   currentAbsHum = ClimateMath::calculateAbsHumidity(currentTemp, currentHum);
   currentDP = ClimateMath::calculateDewPoint(currentTemp, currentHum);
 
-  // --- SMART STATE MACHINE v5.2 ---
-  unsigned long now = millis();
-
-  // Helper: Update slope window (called only during VENTILATING logging)
-  // We'll use this for Plateau v2.0 detection
-
-  // =========================================================================
-  // 1. STABLE STATE — Monitoring for ventilation start
-  // =========================================================================
-  if (state == ClimateState::STABLE) {
-    // Reset plateau tracking
-    plateauConfirmCounter = 0;
-    slopeWindowCount = 0;
-    slopeWindowHead = 0;
-    reboundDetected = false;
-
-    if (historyCount > 0) {
-      Record last = getHistoryPoint(historyCount - 1);
-
-      // Detect Vent Start: Sudden Drop in RH or Temp or AbsHum
-      // FIX: Add lockout period after returning from TARGET_MET/INEFFICIENT
-      unsigned long timeSinceStable = now - stateEnterTime;
-      bool lockoutActive = (timeSinceStable < STATE_LOCKOUT_MS);
-
-      // Winter triggers (RH% based)
-      bool rapidHumDrop = (last.h - currentHum) > VENT_TRIGGER_HUM_DROP;
-      bool rapidTempDrop =
-          (!isnan(lastTempForWindowCheck) &&
-           (lastTempForWindowCheck - currentTemp) > VENT_TRIGGER_TEMP_DROP);
-
-      // Summer trigger (AbsHum based) - works when RH% doesn't change much
-      bool rapidAbsHumDrop =
-          (!isnan(prevAbsHumForTrigger) &&
-           (prevAbsHumForTrigger - currentAbsHum) > VENT_TRIGGER_ABSHUM_DROP);
-
-      bool anyTrigger = (rapidHumDrop || rapidTempDrop || rapidAbsHumDrop);
-
-      // Hysteresis: require VENT_TRIGGER_CONFIRM consecutive readings to
-      // confirm
-      if (anyTrigger && !lockoutActive) {
-        triggerConfirmCount++;
-        if (triggerConfirmCount >= VENT_TRIGGER_CONFIRM) {
-          state = ClimateState::VENTILATING;
-          stateEnterTime = now;
-          stateEnterAbsHum = currentAbsHum;
-          stateEnterHum = currentHum; // Save for adaptive target
-          lastTempForWindowCheck = currentTemp;
-          lastAbsHumForWindowCheck = currentAbsHum;
-
-          // Reset plateau tracking for new ventilation session
-          plateauConfirmCounter = 0;
-          slopeWindowCount = 0;
-          slopeWindowHead = 0;
-          reboundDetected = false;
-          reboundStartTemp = NAN;
-          triggerConfirmCount = 0;
-
-          Serial.println("[STATE] STABLE -> VENTILATING (Smart Trigger v3.3)");
-        }
-      } else {
-        // Reset confirmation counter if trigger conditions not met
-        triggerConfirmCount = 0;
-      }
-    }
-
-    // Keep baseline updated (every 50 readings = ~5 minutes at 6s interval)
-    // FIX: Using class member instead of static variable
-    if (++baselineUpdateCounter >= 50) {
-      baselineUpdateCounter = 0;
-      lastTempForWindowCheck = currentTemp;
-      lastAbsHumForWindowCheck = currentAbsHum;
-    }
-
-    // Update previous AbsHum for summer trigger delta detection
+  // FIX v3.4: Initialize baseline on first valid reading
+  // This enables triggers to work immediately after boot
+  if (isnan(lastHumForWindowCheck)) {
+    lastHumForWindowCheck = currentHum;
+    lastTempForWindowCheck = currentTemp;
+    lastAbsHumForWindowCheck = currentAbsHum;
     prevAbsHumForTrigger = currentAbsHum;
   }
 
-  // =========================================================================
-  // 2. VENTILATING STATE — Active drying, checking for success or plateau
-  // =========================================================================
-  else if (state == ClimateState::VENTILATING) {
-    unsigned long dur = now - stateEnterTime;
+  // --- STATE MACHINE v6.0 - Pure Function Pattern ---
+  unsigned long now = millis();
 
-    // NOTE: slopeWindow is now updated in update() every 30 sec (synchronized
-    // with history) This gives us 6 points × 30 sec = 3 min window for plateau
-    // detection
-
-    // --- A. SUCCESS CONDITION (Highest Priority) ---
-    // Adaptive target: max(50%, startHum - 15%)
-    float targetHum = max(50.0f, stateEnterHum - 15.0f);
-
-    if (currentHum <= targetHum) {
-      state = ClimateState::TARGET_MET;
-      stateEnterTime = now;
-      lastTempForWindowCheck = currentTemp;
-      lastAbsHumForWindowCheck = currentAbsHum;
-      reboundDetected = false;
-      reboundStartTemp = NAN;
-      Serial.printf("[STATE] VENTILATING -> TARGET_MET (%.1f%% <= %.1f%%)\n",
-                    currentHum, targetHum);
-    }
-
-    // --- B. PLATEAU DETECTION v3.0 (Only if NOT target met) ---
-    // Conditions: After 3 min, with enough data, slope is flat for 90 seconds
-    // Adaptive threshold: higher humidity = faster expected drying
-    else if (dur > 180000 &&
-             slopeWindowCount >= 3) { // Check after 3 min with min 3 points
-
-      // Calculate average slope from window
-      // Simple approach: (newest - oldest) / count
-      size_t oldestIdx =
-          (slopeWindowHead + SLOPE_WINDOW_SIZE - slopeWindowCount) %
-          SLOPE_WINDOW_SIZE;
-      float oldestAbs = slopeWindow[oldestIdx];
-      float newestAbs = slopeWindow[(slopeWindowHead + SLOPE_WINDOW_SIZE - 1) %
-                                    SLOPE_WINDOW_SIZE];
-
-      if (!isnan(oldestAbs) && !isnan(newestAbs)) {
-        // slope in g/m³ over the window period (~3 min with 6 points at 30s
-        // intervals)
-        float slope = newestAbs - oldestAbs;
-
-        // ADAPTIVE PLATEAU v3.0: Scale threshold based on starting humidity
-        // At 70% RH: expect faster drying (-0.21 g/m³ over 3min)
-        // At 50% RH: slower drying expected (-0.15 g/m³ over 3min)
-        // Linear interpolation: threshold = -0.15 + (startHum - 50) * 0.003
-        float adaptiveThreshold = PLATEAU_SLOPE_THRESHOLD;
-        if (!isnan(stateEnterHum)) {
-          float humFactor = constrain(stateEnterHum, 50.0f, 70.0f) - 50.0f;
-          adaptiveThreshold = PLATEAU_SLOPE_THRESHOLD - (humFactor * 0.003f);
-        }
-
-        if (slope > adaptiveThreshold) {
-          plateauConfirmCounter++;
-          // Need PLATEAU_CONFIRM_COUNT consecutive readings to confirm
-          if (plateauConfirmCounter >= PLATEAU_CONFIRM_COUNT) {
-            // Additional check: Did we achieve at least 10% drop from start?
-            float dropPercent =
-                ((stateEnterAbsHum - currentAbsHum) / stateEnterAbsHum) *
-                100.0f;
-
-            state = ClimateState::INEFFICIENT;
-            stateEnterTime = now;
-            lastTempForWindowCheck = currentTemp;
-            lastAbsHumForWindowCheck = currentAbsHum;
-            reboundDetected = false;
-            reboundStartTemp = NAN;
-            Serial.printf("[STATE] VENTILATING -> INEFFICIENT (slope=%.3f, "
-                          "thresh=%.3f, drop=%.1f%%)\n",
-                          slope, adaptiveThreshold, dropPercent);
-          }
-        } else {
-          // Still drying effectively — reset confirmation counter
-          plateauConfirmCounter = 0;
-        }
-      }
-    }
-
-    // --- C. IMPROVED REBOUND DETECTION (Window Closed) ---
-    // Use rate of temperature change, not absolute threshold
-    if (!isnan(reboundStartTemp)) {
-      float tempRise = currentTemp - reboundStartTemp;
-      unsigned long reboundDur = now - reboundStartTime;
-
-      // If temp rose by configured threshold over configured time → window is
-      // closed
-      if (tempRise > REBOUND_TEMP_RISE && reboundDur > REBOUND_TIME_MS) {
-        state = ClimateState::STABLE;
-        stateEnterTime = now;
-        lastTempForWindowCheck = currentTemp;
-        lastAbsHumForWindowCheck = currentAbsHum;
-        Serial.printf(
-            "[STATE] VENTILATING -> STABLE (Rebound: +%.2f°C in %lus)\n",
-            tempRise, reboundDur / 1000);
-      }
-      // If temp started falling again — reset rebound detection
-      else if (currentTemp < reboundStartTemp) {
-        reboundStartTemp = NAN;
-        reboundDetected = false;
-      }
-    } else {
-      // Start watching for rebound if temp starts rising
-      if (!isnan(lastAbsHum) && currentTemp > lastTempForWindowCheck + 0.05f) {
-        reboundStartTemp = lastTempForWindowCheck;
-        reboundStartTime = now;
-        reboundDetected = true;
-      }
-    }
-
-    // Fallback: Old absolute threshold (faster for obvious window close)
-    if (currentAbsHum - lastAbsHumForWindowCheck > REBOUND_ABSHUM_RISE) {
-      state = ClimateState::STABLE;
-      stateEnterTime = now;
-      lastTempForWindowCheck = currentTemp;
-      lastAbsHumForWindowCheck = currentAbsHum;
-      Serial.println("[STATE] VENTILATING -> STABLE (AbsHum rebound)");
-    }
+  // Calculate slope window summary for plateau detection
+  float slopeNewest = NAN, slopeOldest = NAN;
+  if (slopeWindowCount >= 3) {
+    size_t oldestIdx = (slopeWindowHead + SLOPE_WINDOW_SIZE - slopeWindowCount) % SLOPE_WINDOW_SIZE;
+    slopeOldest = slopeWindow[oldestIdx];
+    slopeNewest = slopeWindow[(slopeWindowHead + SLOPE_WINDOW_SIZE - 1) % SLOPE_WINDOW_SIZE];
   }
 
-  // =========================================================================
-  // 3. TARGET_MET — Success! Waiting for window close confirmation
-  // =========================================================================
-  else if (state == ClimateState::TARGET_MET) {
-    // Improved rebound detection (same logic)
-    if (!isnan(reboundStartTemp)) {
-      float tempRise = currentTemp - reboundStartTemp;
-      unsigned long reboundDur = now - reboundStartTime;
+  // Pack all inputs for the pure decision function
+  StateInput in;
+  in.temp = currentTemp;
+  in.hum = currentHum;
+  in.absHum = currentAbsHum;
+  in.baseTemp = lastTempForWindowCheck;
+  in.baseHum = lastHumForWindowCheck;
+  in.baseAbsHum = lastAbsHumForWindowCheck;
+  in.prevAbsHum = prevAbsHumForTrigger;
+  in.currentState = state;
+  in.stateEnterTime = stateEnterTime;
+  in.now = now;
+  in.triggerConfirmCount = triggerConfirmCount;
+  in.plateauConfirmCount = plateauConfirmCounter;
+  in.baselineUpdateCount = baselineUpdateCounter;
+  in.reboundStartTemp = reboundStartTemp;
+  in.reboundStartTime = reboundStartTime;
+  in.slopeNewest = slopeNewest;
+  in.slopeOldest = slopeOldest;
+  in.slopeCount = slopeWindowCount;
+  in.stateEnterHum = stateEnterHum;
+  in.stateEnterAbsHum = stateEnterAbsHum;
 
-      if (tempRise > REBOUND_TEMP_RISE && reboundDur > REBOUND_TIME_MS) {
-        state = ClimateState::STABLE;
-        stateEnterTime = now; // For lockout
-        // FIX: Update baseline to prevent false re-detection
-        lastTempForWindowCheck = currentTemp;
-        lastAbsHumForWindowCheck = currentAbsHum;
-        Serial.printf("[STATE] TARGET_MET -> STABLE (Rebound confirmed)\n");
-      } else if (currentTemp < reboundStartTemp) {
-        reboundStartTemp = NAN;
-        reboundDetected = false;
-      }
-    } else {
-      if (currentTemp > lastTempForWindowCheck + 0.05f) {
-        reboundStartTemp = lastTempForWindowCheck;
-        reboundStartTime = now;
-      }
-    }
+  // Call pure decision function
+  StateOutput out = computeTransition(in);
 
-    if (currentAbsHum - lastAbsHumForWindowCheck > REBOUND_ABSHUM_RISE) {
-      state = ClimateState::STABLE;
-      stateEnterTime = now;
-      lastTempForWindowCheck = currentTemp;
-      lastAbsHumForWindowCheck = currentAbsHum;
-      Serial.println("[STATE] TARGET_MET -> STABLE (AbsHum rebound)");
-    }
+  // Apply output to class state
+  state = out.newState;
+  stateEnterTime = out.newStateEnterTime;
+  triggerConfirmCount = out.newTriggerCount;
+  plateauConfirmCounter = out.newPlateauCount;
+  baselineUpdateCounter = out.newBaselineCounter;
+  reboundStartTemp = out.newReboundStartTemp;
+  reboundStartTime = out.newReboundStartTime;
+  stateEnterHum = out.newStateEnterHum;
+  stateEnterAbsHum = out.newStateEnterAbsHum;
 
-    if (now - stateEnterTime > 3600000) {
-      state = ClimateState::STABLE;
-      stateEnterTime = now;
-      lastTempForWindowCheck = currentTemp;
-      lastAbsHumForWindowCheck = currentAbsHum;
-      Serial.println("[STATE] TARGET_MET -> STABLE (Timeout 1h)");
-    }
+  if (out.updateBaseline) {
+    lastTempForWindowCheck = out.newBaseTemp;
+    lastHumForWindowCheck = out.newBaseHum;
+    lastAbsHumForWindowCheck = out.newBaseAbsHum;
   }
 
-  // =========================================================================
-  // 4. INEFFICIENT — Plateau reached, waiting for window close
-  // =========================================================================
-  else if (state == ClimateState::INEFFICIENT) {
-    // Same rebound detection as TARGET_MET
-    if (!isnan(reboundStartTemp)) {
-      float tempRise = currentTemp - reboundStartTemp;
-      unsigned long reboundDur = now - reboundStartTime;
-
-      if (tempRise > REBOUND_TEMP_RISE && reboundDur > REBOUND_TIME_MS) {
-        state = ClimateState::STABLE;
-        stateEnterTime = now;
-        lastTempForWindowCheck = currentTemp;
-        lastAbsHumForWindowCheck = currentAbsHum;
-        Serial.printf("[STATE] INEFFICIENT -> STABLE (Rebound confirmed)\n");
-      } else if (currentTemp < reboundStartTemp) {
-        reboundStartTemp = NAN;
-      }
-    } else {
-      if (currentTemp > lastTempForWindowCheck + 0.05f) {
-        reboundStartTemp = lastTempForWindowCheck;
-        reboundStartTime = now;
-      }
-    }
-
-    if (currentAbsHum - lastAbsHumForWindowCheck > REBOUND_ABSHUM_RISE) {
-      state = ClimateState::STABLE;
-      stateEnterTime = now;
-      lastTempForWindowCheck = currentTemp;
-      lastAbsHumForWindowCheck = currentAbsHum;
-      Serial.println("[STATE] INEFFICIENT -> STABLE (AbsHum rebound)");
-    }
-
-    // Timeout fallback
-    if (now - stateEnterTime > 3600000) {
-      state = ClimateState::STABLE;
-      stateEnterTime = now;
-      lastTempForWindowCheck = currentTemp;
-      lastAbsHumForWindowCheck = currentAbsHum;
-      Serial.println("[STATE] INEFFICIENT -> STABLE (Timeout 1h)");
-    }
+  // Log state transitions for debugging
+  if (out.transitionReason != nullptr) {
+    Serial.printf("[STATE] %s\n", out.transitionReason);
   }
+
+  // Reset plateau tracking when entering STABLE
+  if (state == ClimateState::STABLE) {
+    slopeWindowCount = 0;
+    slopeWindowHead = 0;
+    reboundDetected = false;
+  }
+
+  // Update previous AbsHum for next iteration
+  prevAbsHumForTrigger = currentAbsHum;
 
   // Physics Tracking Update
   lastAbsHum = currentAbsHum;
@@ -736,63 +827,6 @@ String SensorManager::getDryingIndicator() const {
     return "▲"; // Normal drying
   } else {
     return "▼"; // Slow drying
-  }
-}
-
-// --- UNIFIED STATUS DISPLAY v3.3 ---
-unsigned long SensorManager::getStateDurationMinutes() const {
-  return (millis() - stateEnterTime) / 60000;
-}
-
-void SensorManager::getUnifiedStatus(char *buffer, size_t bufferSize) const {
-  if (bufferSize < 64) {
-    buffer[0] = '\0';
-    return;
-  }
-
-  unsigned long minutes = getStateDurationMinutes();
-
-  switch (state) {
-  case ClimateState::STABLE:
-    // No timer/indicator for stable state - just show regular advice
-    snprintf(buffer, bufferSize, "Стабильно");
-    break;
-
-  case ClimateState::VENTILATING: {
-    // "Сушка (5 мин) ▲▲"
-    float rate = getDryingRate();
-    const char *indicator;
-    if (rate >= RATE_EXCELLENT) {
-      indicator = "▲▲";
-    } else if (rate >= RATE_GOOD) {
-      indicator = "▲";
-    } else if (rate > 0) {
-      indicator = "▼";
-    } else {
-      indicator = ""; // Not enough data yet
-    }
-
-    if (minutes < 1) {
-      snprintf(buffer, bufferSize, "Сушка... %s", indicator);
-    } else {
-      snprintf(buffer, bufferSize, "Сушка (%lu мин) %s", minutes, indicator);
-    }
-    break;
-  }
-
-  case ClimateState::TARGET_MET:
-    // "Готово (за 12 мин) Закрывай"
-    snprintf(buffer, bufferSize, "Готово (за %lu мин) Закрывай", minutes);
-    break;
-
-  case ClimateState::INEFFICIENT:
-    // "Эффект упал (25 мин). Закрывай"
-    snprintf(buffer, bufferSize, "Эффект упал (%lu мин). Закрывай", minutes);
-    break;
-
-  default:
-    snprintf(buffer, bufferSize, "???");
-    break;
   }
 }
 

@@ -1,11 +1,16 @@
 #pragma once
 
 #include "Settings.h"
+
+#ifdef UNIT_TEST
+#include "MockArduino.h"
+#else
 #include <Arduino.h>
 #include <DHT.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#endif
 
 #include <vector>
 
@@ -65,6 +70,69 @@ public:
   // New Enum States (Must be defined before usage)
   enum class ClimateState { STABLE, VENTILATING, TARGET_MET, INEFFICIENT };
 
+  // =========================================================================
+  // STATE MACHINE v6.0 - Pure Function Architecture
+  // =========================================================================
+
+  // All inputs needed for state transition decision (immutable)
+  struct StateInput {
+    // Current sensor readings
+    float temp, hum, absHum;
+    
+    // Baseline values (for trigger detection)
+    float baseTemp, baseHum, baseAbsHum;
+    float prevAbsHum;  // Previous reading for delta trigger
+    
+    // Current state context
+    ClimateState currentState;
+    unsigned long stateEnterTime;
+    unsigned long now;
+    
+    // Counters
+    unsigned int triggerConfirmCount;
+    unsigned int plateauConfirmCount;
+    unsigned int baselineUpdateCount;
+    
+    // Rebound tracking
+    float reboundStartTemp;
+    unsigned long reboundStartTime;
+    
+    // Plateau detection (slope window summary)
+    float slopeNewest, slopeOldest;
+    size_t slopeCount;
+    
+    // Initial values for adaptive thresholds
+    float stateEnterHum, stateEnterAbsHum;
+  };
+
+  // All mutations from state transition decision
+  struct StateOutput {
+    ClimateState newState;
+    unsigned long newStateEnterTime;
+    
+    // Baseline updates
+    bool updateBaseline;
+    float newBaseTemp, newBaseHum, newBaseAbsHum;
+    
+    // Counter updates
+    unsigned int newTriggerCount;
+    unsigned int newPlateauCount;
+    unsigned int newBaselineCounter;
+    
+    // Rebound tracking updates
+    float newReboundStartTemp;
+    unsigned long newReboundStartTime;
+    
+    // State entry values (set on state change)
+    float newStateEnterHum, newStateEnterAbsHum;
+    
+    // Debug
+    const char* transitionReason;  // nullptr if no state change
+  };
+
+  // Pure decision function (no side effects)
+  static StateOutput computeTransition(const StateInput& in);
+
   ClimateState getClimateState() const;
 
   // Legacy/Helper Support
@@ -75,11 +143,6 @@ public:
   // Drying Speedometer v3.3
   float getDryingRate() const;       // Returns g/m³/min during ventilation
   String getDryingIndicator() const; // Returns ▲▲, ▲, ▼, or - based on rate
-
-  // Unified Status Display v3.3
-  unsigned long getStateDurationMinutes() const; // Minutes since state entered
-  void getUnifiedStatus(char *buffer,
-                        size_t bufferSize) const; // Memory-safe status string
 
   // Thread Safety
   void lock();
@@ -113,6 +176,7 @@ private:
 
   // Window Detection State & Physics Tracking
   float lastTempForWindowCheck;
+  float lastHumForWindowCheck;    // RH% baseline for trigger detection
   float lastAbsHumForWindowCheck; // Rebound Detection
   float stateEnterAbsHum;         // Efficiency Tracking
   float lastAbsHum;               // Filter/Smooth
@@ -146,7 +210,11 @@ private:
   // Helper Functions
   // float calculateDropRate() const; // DEPRECATED: Physics-based logic used
   // instead
-  void processReading(float t, float h);
   void addHistoryPoint(float t, float h);
   void updateAdvice(); // Updates the cached string
+
+#ifdef UNIT_TEST
+public:
+#endif
+  void processReading(float t, float h);
 };
