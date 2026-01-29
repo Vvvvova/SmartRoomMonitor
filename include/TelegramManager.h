@@ -4,7 +4,7 @@
 #include <UniversalTelegramBot.h>
 #include <vector>
 #include "Settings.h"
-#include "SensorManager.h"
+#include "CoreState.h"
 
 // Struct for Subscriber
 struct Subscriber {
@@ -16,20 +16,19 @@ struct Subscriber {
 
 class TelegramManager {
 public:
-    TelegramManager(SensorManager* sm);
+    TelegramManager();
     void begin();
     void update(); // Main loop handler
     
     void broadcastAlert(const String& msg, int level); // level: 1=Info/Green, 2=Warn/Red
     
 private:
-    SensorManager* sensorManager;
     WiFiClientSecure client;
     UniversalTelegramBot* bot;
     
     unsigned long lastPollTime;
     int lastAdviceCode; // To track changes
-    SensorManager::ClimateState lastClimateState;
+    ClimateState lastClimateState;
     bool moldAlertSent;
     bool timeoutAlertSent;
     

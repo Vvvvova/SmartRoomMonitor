@@ -1,0 +1,380 @@
+#include "vibe/ClimateEngine.h"
+#include "ClimateMath.h"
+
+ClimateEngine::ClimateEngine()
+    : lastTempForWindowCheck(NAN), lastHumForWindowCheck(NAN),
+      lastAbsHumForWindowCheck(NAN), stateEnterAbsHum(NAN), stateEnterHum(NAN),
+      slopeWindowHead(0), slopeWindowCount(0), plateauConfirmCounter(0),
+      baselineUpdateCounter(0), reboundStartTime(0), reboundStartTemp(NAN),
+      triggerConfirmCount(0), prevAbsHumForTrigger(NAN),
+      state(ClimateState::STABLE), stateEnterTime(0),
+      lastHistoryLogTime(0) {
+    for (size_t i = 0; i < SLOPE_WINDOW_SIZE; i++) {
+        slopeWindow[i] = NAN;
+    }
+}
+
+unsigned long ClimateEngine::getSuggestedTickInterval() const {
+    // Active states need faster polling for responsiveness
+    if (state == ClimateState::VENTILATING) return 10000; // 10s
+    
+    // Intermediate states
+    if (state == ClimateState::TARGET_MET || state == ClimateState::INEFFICIENT) return 30000; // 30s
+    
+    // Stable state - save battery/cpu, but keeping it reasonable
+    // Default was ~2 mins in main.cpp logic
+    return 120000; // 2 minutes
+}
+
+ClimateEngine::EngineResult ClimateEngine::process(const CoreSnapshot& sn, unsigned long now) {
+    EngineResult result;
+    
+    // Extract for readability
+    float t = sn.temp;
+    float h = sn.hum;
+    float absHum = sn.absHum;
+
+    // 1. Initialize baseline on first valid reading
+    if (isnan(lastHumForWindowCheck)) {
+        lastHumForWindowCheck = h;
+        lastTempForWindowCheck = t;
+        lastAbsHumForWindowCheck = absHum;
+        prevAbsHumForTrigger = absHum;
+    }
+
+    // 2. Update slope tracking during ventilation
+    if (state != ClimateState::STABLE) {
+        updateSlope(absHum);
+    }
+
+    // 3. Prepare State Machine Inputs
+    float slopeNewest = NAN, slopeOldest = NAN;
+    if (slopeWindowCount >= 3) {
+        size_t oldestIdx = (slopeWindowHead + SLOPE_WINDOW_SIZE - slopeWindowCount) % SLOPE_WINDOW_SIZE;
+        slopeOldest = slopeWindow[oldestIdx];
+        slopeNewest = slopeWindow[(slopeWindowHead + SLOPE_WINDOW_SIZE - 1) % SLOPE_WINDOW_SIZE];
+    }
+
+    StateInput in;
+    in.temp = t;
+    in.hum = h;
+    in.absHum = absHum;
+    in.baseTemp = lastTempForWindowCheck;
+    in.baseHum = lastHumForWindowCheck;
+    in.baseAbsHum = lastAbsHumForWindowCheck;
+    in.prevAbsHum = prevAbsHumForTrigger;
+    in.currentState = state;
+    in.stateEnterTime = stateEnterTime;
+    in.now = now;
+    in.triggerConfirmCount = triggerConfirmCount;
+    in.plateauConfirmCount = plateauConfirmCounter;
+    in.baselineUpdateCount = baselineUpdateCounter;
+    in.reboundStartTemp = reboundStartTemp;
+    in.reboundStartTime = reboundStartTime;
+    in.slopeNewest = slopeNewest;
+    in.slopeOldest = slopeOldest;
+    in.slopeCount = slopeWindowCount;
+    in.stateEnterHum = stateEnterHum;
+    in.stateEnterAbsHum = stateEnterAbsHum;
+
+    // 4. Run Pure Decision Logic
+    StateOutput out = computeTransition(in);
+
+    // 5. Apply Updates
+    bool changed = (state != out.newState);
+    state = out.newState;
+    stateEnterTime = out.newStateEnterTime;
+    triggerConfirmCount = out.newTriggerCount;
+    plateauConfirmCounter = out.newPlateauCount;
+    baselineUpdateCounter = out.newBaselineCounter;
+    reboundStartTemp = out.newReboundStartTemp;
+    reboundStartTime = out.newReboundStartTime;
+    stateEnterHum = out.newStateEnterHum;
+    stateEnterAbsHum = out.newStateEnterAbsHum;
+
+    if (out.updateBaseline) {
+        lastTempForWindowCheck = out.newBaseTemp;
+        lastHumForWindowCheck = out.newBaseHum;
+        lastAbsHumForWindowCheck = out.newBaseAbsHum;
+    }
+
+    if (out.transitionReason != nullptr && changed) {
+        Serial.printf("[ENGINE] %s\n", out.transitionReason);
+    }
+
+    // Reset tracking if we returned to stable
+    if (state == ClimateState::STABLE) {
+        slopeWindowCount = 0;
+        slopeWindowHead = 0;
+    }
+
+    prevAbsHumForTrigger = absHum;
+    
+    // =========================================================================
+    // 6. POPULATE RESULT
+    // =========================================================================
+    result.stateChanged = changed;
+    result.state = state;
+    result.stateEnterTime = stateEnterTime;
+    
+    // A. Advice Logic
+    AdviceInput advIn;
+    advIn.temp = t;
+    advIn.hum = h;
+    advIn.absHum = absHum;
+    advIn.dewPoint = sn.dewPoint;
+    advIn.state = state;
+    advIn.stateEnterTime = stateEnterTime;
+    advIn.now = now;
+    advIn.dryingInd = getDryingIndicator(now);
+    
+    if (sn.weatherValid) {
+        advIn.weatherValid = true;
+        advIn.outTemp = sn.outTemp;
+        advIn.outAbsHum = sn.outAbsHum;
+    }
+    
+    AdviceOutput advOut = AdviceEngine::compute(advIn);
+    result.adviceText = advOut.text;
+    result.adviceCode = advOut.code;
+    
+    result.dryingRate = getDryingRate(now);
+    result.dryingInd = advIn.dryingInd;
+    
+    // B. Poll Interval Logic
+    result.suggestPollInterval = getSuggestedTickInterval();
+    
+    // C. History Logging Logic
+    // Logic: 30s in active mode, 3m in stable mode
+    unsigned long logInterval = (state == ClimateState::VENTILATING) ? 30000 : 180000;
+    if (now - lastHistoryLogTime >= logInterval) {
+        result.shouldLogHistory = true;
+        lastHistoryLogTime = now;
+    } else {
+        result.shouldLogHistory = false;
+    }
+    
+    return result;
+}
+
+void ClimateEngine::updateSlope(float absHum) {
+    // Only update slope window periodically (e.g. every 30s) or let caller handle it.
+    // For now, mirroring SensorManager behavior but optimized.
+    // In original code, it updated every log cycle (30s during vent).
+    // Here we just add it to ring buffer.
+    slopeWindow[slopeWindowHead] = absHum;
+    slopeWindowHead = (slopeWindowHead + 1) % SLOPE_WINDOW_SIZE;
+    if (slopeWindowCount < SLOPE_WINDOW_SIZE) slopeWindowCount++;
+}
+
+float ClimateEngine::getDryingRate(unsigned long now) const {
+    if (state != ClimateState::VENTILATING && state != ClimateState::TARGET_MET) return 0.0f;
+    unsigned long dur = now - stateEnterTime;
+    if (dur < 60000 || isnan(stateEnterAbsHum)) return 0.0f;
+    
+    float absHumDrop = stateEnterAbsHum - slopeWindow[(slopeWindowHead + SLOPE_WINDOW_SIZE - 1) % SLOPE_WINDOW_SIZE]; 
+    // Fallback to current if slope window is empty? Actually, process() takes current absHum.
+    // Let's use the current state enter vs current logic.
+    return absHumDrop / (dur / 60000.0f);
+}
+
+String ClimateEngine::getDryingIndicator(unsigned long now) const {
+    float rate = getDryingRate(now);
+    if (rate <= 0.0f) return "-";
+    if (rate >= RATE_EXCELLENT) return "▲▲";
+    if (rate >= RATE_GOOD) return "▲";
+    return "▼";
+}
+
+// =============================================================================
+// TRANSITION LOGIC (Pasted from SensorManager)
+// =============================================================================
+ClimateEngine::StateOutput
+ClimateEngine::computeTransition(const StateInput& in) {
+  StateOutput out;
+  
+  // Initialize output with current state (no change by default)
+  out.newState = in.currentState;
+  out.newStateEnterTime = in.stateEnterTime;
+  out.updateBaseline = false;
+  out.newBaseTemp = in.baseTemp;
+  out.newBaseHum = in.baseHum;
+  out.newBaseAbsHum = in.baseAbsHum;
+  out.newTriggerCount = in.triggerConfirmCount;
+  out.newPlateauCount = in.plateauConfirmCount;
+  out.newBaselineCounter = in.baselineUpdateCount;
+  out.newReboundStartTemp = in.reboundStartTemp;
+  out.newReboundStartTime = in.reboundStartTime;
+  out.newStateEnterHum = in.stateEnterHum;
+  out.newStateEnterAbsHum = in.stateEnterAbsHum;
+  out.transitionReason = nullptr;
+
+  unsigned long timeSinceStateEnter = in.now - in.stateEnterTime;
+
+  // --- STABLE ---
+  if (in.currentState == ClimateState::STABLE) {
+    out.newPlateauCount = 0;
+    out.newReboundStartTemp = NAN;
+
+    bool lockoutActive = (timeSinceStateEnter < STATE_LOCKOUT_MS);
+
+    bool rapidHumDrop = (!isnan(in.baseHum) && (in.baseHum - in.hum) > VENT_TRIGGER_HUM_DROP);
+    bool rapidTempDrop = (!isnan(in.baseTemp) && (in.baseTemp - in.temp) > VENT_TRIGGER_TEMP_DROP);
+    bool rapidAbsHumDrop = (!isnan(in.prevAbsHum) && (in.prevAbsHum - in.absHum) > VENT_TRIGGER_ABSHUM_DROP);
+
+    if ((rapidHumDrop || rapidTempDrop || rapidAbsHumDrop) && !lockoutActive) {
+      out.newTriggerCount = in.triggerConfirmCount + 1;
+      if (out.newTriggerCount >= VENT_TRIGGER_CONFIRM) {
+        out.newState = ClimateState::VENTILATING;
+        out.newStateEnterTime = in.now;
+        out.newStateEnterHum = in.hum;
+        out.newStateEnterAbsHum = in.absHum;
+        out.updateBaseline = true;
+        out.newBaseTemp = in.temp;
+        out.newBaseHum = in.hum;
+        out.newBaseAbsHum = in.absHum;
+        out.newTriggerCount = 0;
+        out.transitionReason = "STABLE -> VENTILATING (Trigger)";
+      }
+    } else {
+      out.newTriggerCount = 0;
+    }
+
+    out.newBaselineCounter = in.baselineUpdateCount + 1;
+    if (out.newBaselineCounter >= 50) {
+      out.newBaselineCounter = 0;
+      out.updateBaseline = true;
+      out.newBaseTemp = in.temp;
+      out.newBaseHum = in.hum;
+      out.newBaseAbsHum = in.absHum;
+    }
+  }
+
+  // --- VENTILATING ---
+  else if (in.currentState == ClimateState::VENTILATING) {
+    float targetHum = fmax(50.0f, in.stateEnterHum - 15.0f);
+    if (in.hum <= targetHum) {
+      out.newState = ClimateState::TARGET_MET;
+      out.newStateEnterTime = in.now;
+      out.updateBaseline = true;
+      out.newBaseTemp = in.temp;
+      out.newBaseHum = in.hum;
+      out.newBaseAbsHum = in.absHum;
+      out.transitionReason = "VENTILATING -> TARGET_MET";
+    }
+    else if (timeSinceStateEnter > 180000 && in.slopeCount >= 3) {
+      float slope = in.slopeNewest - in.slopeOldest;
+      float adaptiveThreshold = PLATEAU_SLOPE_THRESHOLD;
+      if (!isnan(in.stateEnterHum)) {
+        float humFactor = fmin(fmax(in.stateEnterHum, 50.0f), 70.0f) - 50.0f;
+        adaptiveThreshold = PLATEAU_SLOPE_THRESHOLD - (humFactor * 0.003f);
+      }
+
+      if (!isnan(slope) && slope > 0.05f) {
+        out.newState = ClimateState::STABLE;
+        out.newStateEnterTime = in.now;
+        out.updateBaseline = true;
+        out.newBaseTemp = in.temp;
+        out.newBaseHum = in.hum;
+        out.newBaseAbsHum = in.absHum;
+        out.transitionReason = "VENTILATING -> STABLE (Rising hum)";
+      } else if (!isnan(slope) && slope > adaptiveThreshold) {
+        out.newPlateauCount = in.plateauConfirmCount + 1;
+        if (out.newPlateauCount >= PLATEAU_CONFIRM_COUNT) {
+          out.newState = ClimateState::INEFFICIENT;
+          out.newStateEnterTime = in.now;
+          out.updateBaseline = true;
+          out.newBaseTemp = in.temp;
+          out.newBaseHum = in.hum;
+          out.newBaseAbsHum = in.absHum;
+          out.transitionReason = "VENTILATING -> INEFFICIENT (Plateau)";
+        }
+      } else {
+        out.newPlateauCount = 0;
+      }
+    }
+
+    // Rebound
+    if (out.newState == ClimateState::VENTILATING) {
+      if (!isnan(in.reboundStartTemp)) {
+        if ((in.temp - in.reboundStartTemp) > REBOUND_TEMP_RISE && (in.now - in.reboundStartTime) > REBOUND_TIME_MS) {
+          out.newState = ClimateState::STABLE;
+          out.newStateEnterTime = in.now;
+          out.updateBaseline = true;
+          out.transitionReason = "VENTILATING -> STABLE (Rebound Temp)";
+        } else if (in.temp < in.reboundStartTemp) out.newReboundStartTemp = NAN;
+      } else if (in.temp > in.baseTemp + 0.05f) {
+        out.newReboundStartTemp = in.baseTemp;
+        out.newReboundStartTime = in.now;
+      }
+
+      if (out.newState == ClimateState::VENTILATING && (in.absHum - in.baseAbsHum) > REBOUND_ABSHUM_RISE) {
+        out.newState = ClimateState::STABLE;
+        out.newStateEnterTime = in.now;
+        out.updateBaseline = true;
+        out.transitionReason = "VENTILATING -> STABLE (Rebound AbsHum)";
+      }
+    }
+  }
+  
+  // --- TARGET_MET / INEFFICIENT (Shared rebound logic) ---
+  else {
+    if (!isnan(in.reboundStartTemp)) {
+      if ((in.temp - in.reboundStartTemp) > REBOUND_TEMP_RISE && (in.now - in.reboundStartTime) > REBOUND_TIME_MS) {
+        out.newState = ClimateState::STABLE;
+        out.newStateEnterTime = in.now;
+        out.updateBaseline = true;
+        out.transitionReason = "CLOSE -> STABLE (Rebound Temp)";
+      } else if (in.temp < in.reboundStartTemp) out.newReboundStartTemp = NAN;
+    } else if (in.temp > in.baseTemp + 0.05f) {
+      out.newReboundStartTemp = in.baseTemp;
+      out.newReboundStartTime = in.now;
+    }
+
+    if (out.newState != ClimateState::STABLE && (in.absHum - in.baseAbsHum) > REBOUND_ABSHUM_RISE) {
+      out.newState = ClimateState::STABLE;
+      out.newStateEnterTime = in.now;
+      out.updateBaseline = true;
+      out.transitionReason = "CLOSE -> STABLE (Rebound AbsHum)";
+    }
+
+    if (out.newState != ClimateState::STABLE && timeSinceStateEnter > 3600000) {
+      out.newState = ClimateState::STABLE;
+      out.newStateEnterTime = in.now;
+      out.updateBaseline = true;
+      out.transitionReason = "CLOSE -> STABLE (Timeout)";
+    }
+  }
+
+  return out;
+}
+
+void ClimateEngine::updateCoreState(CoreState& state, const EngineResult& result) {
+    state.lock();
+    state.state = result.state;
+    state.stateEnterTime = result.stateEnterTime;
+    state.advice = result.adviceText;
+    state.adviceCode = result.adviceCode;
+    state.dryingRate = result.dryingRate;
+    state.dryingInd = result.dryingInd;
+    state.heapFree = ESP.getFreeHeap();
+    state.heapMin = ESP.getMinFreeHeap();
+    
+    // Feedback Loop: Tell sensors how fast to poll
+    state.recommendedPollInterval = result.suggestPollInterval;
+
+    // History Logging
+    if (result.shouldLogHistory) {
+         // Snapshot already contains temp/hum from this cycle, 
+         // but wait - result does NOT contain temp/hum. 
+         // We need to fetch current values from state? 
+         // NO, fetching from state inside lock is safe.
+         // BUT wait, state.temp might be updated by SensorManager since we started processing?
+         // Actually, SensorManager writes -> updates timestamp. 
+         // Main loop sees timestamp -> processes -> writes result.
+         // SensorManager won't write again until we finish this cycle ideally, 
+         // OR if it does, using the latest temp is fine.
+         state.addHistoryPoint(state.temp, state.hum);
+    }
+    state.unlock();
+}

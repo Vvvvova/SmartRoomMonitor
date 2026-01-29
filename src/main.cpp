@@ -1,178 +1,130 @@
 /**
  * @file main.cpp
- * @brief Autonomous Smart Climate Monitor Firmware (Modular)
+ * @brief Autonomous Smart Climate Monitor Firmware (Modular & Reactive)
+ *        Version: v4.3 (Reactive Vibe)
  */
 
+#include "CoreState.h"       // Data Hub
 #include "DisplayManager.h"
 #include "SensorManager.h"
 #include "Settings.h"
-#include "TelegramManager.h" // [NEW]
-#include "WeatherManager.h"  // NEW
+#include "TelegramManager.h"
+#include "WeatherManager.h"
 #include "WebManager.h"
+#include "NetworkManager.h" // [NEW] Network Logic
+#include "vibe/ClimateEngine.h"
+#include "AdviceEngine.h"
 #include <Arduino.h>
-#include <WiFi.h>
 
+// Global State Hub
+CoreState g_state;
 
 // Modules
 SensorManager sensorManager;
 DisplayManager displayManager;
-WebManager webManager(&sensorManager);
-WeatherManager weatherManager;                   // NEW
-TelegramManager telegramManager(&sensorManager); // [NEW]
+WebManager webManager;
+WeatherManager weatherManager;
+TelegramManager telegramManager;
+NetworkManager networkManager; // [NEW]
 
-// Timer
-unsigned long lastSensorRead = 0;
-
-// Helper: Get Reset Reason
-String getResetReason() {
-  esp_reset_reason_t reason = esp_reset_reason();
-  switch (reason) {
-  case ESP_RST_POWERON:
-    return "Power On";
-  case ESP_RST_SW:
-    return "Software Reset";
-  case ESP_RST_PANIC:
-    return "Crash/Panic (Watchdog?)";
-  case ESP_RST_INT_WDT:
-    return "Interrupt Watchdog";
-  case ESP_RST_TASK_WDT:
-    return "Task Watchdog";
-  case ESP_RST_WDT:
-    return "Other Watchdog";
-  case ESP_RST_DEEPSLEEP:
-    return "Deep Sleep Wake";
-  case ESP_RST_BROWNOUT:
-    return "Brownout (Low Voltage)";
-  case ESP_RST_SDIO:
-    return "SDIO Reset";
-  default:
-    return "Unknown (" + String(reason) + ")";
-  }
-}
+// Logic Engine (Brain)
+ClimateEngine engine;
 
 void setup() {
   setCpuFrequencyMhz(80);
   Serial.begin(115200);
 
-  // Init Modules
+  // 1. Init Data Hub
+  g_state.init();
+  
+  // Register Main Task for Notifications (Reactivity)
+  g_state.mainTaskHandle = xTaskGetCurrentTaskHandle();
+
+  // 2. Init UI
   displayManager.begin();
-  displayManager.update(NAN, NAN, NAN, false, "CONNECTING...", 0, 0,
-                        "Init WiFi");
-
-  // Connect WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 20) {
-    delay(500);
-    retries++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    displayManager.update(NAN, NAN, NAN, false, "SYNC TIME...", 0, 0,
-                          WiFi.localIP().toString());
-
-    // Time sync
-    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
-    struct tm timeinfo;
-    int timeRetry = 0;
-    // Wait for time (blocking up to 20s)
-    while (!getLocalTime(&timeinfo) && timeRetry < 20) {
-      delay(500);
-      timeRetry++;
-    }
-
-    displayManager.update(NAN, NAN, NAN, false, "GET WEATHER...", 0, 0,
-                          "Weiden (DE)");
-
-    // Weather fetch (blocking up to 10s)
-    weatherManager.update();
-    int wRetry = 0;
-    while (!weatherManager.isDataValid() && wRetry < 20) {
-      weatherManager.update(); // Keep trying
+  
+  // 3. Init Network (WiFi + Time + Reconnect)
+  // This blocks until WiFi/Time is ready or times out
+  networkManager.begin();
+  
+  // 4. Initial Weather Fetch
+  g_state.advice = "GET WEATHER...";
+  g_state.ipAddress = "Weiden (DE)";
+  displayManager.update();
+  
+  weatherManager.update();
+  int wRetry = 0;
+  while (!weatherManager.isDataValid() && wRetry < 20) {
+      weatherManager.update(); 
       delay(500);
       wRetry++;
-    }
-
-  } else {
-    displayManager.update(NAN, NAN, NAN, false, "WIFI FAIL", 0, 0,
-                          "Offline Mode");
   }
 
-  // NOW start sensors (timestamps will be correct)
-  displayManager.update(NAN, NAN, NAN, false, "STARTING...", 0, 0,
-                        "Sensors Init");
+  // 5. Start Services
+  g_state.advice = "STARTING...";
+  g_state.ipAddress = "Sensors Init";
+  displayManager.update();
 
-  // 4. Managers Init — ALWAYS set weather manager (even if offline for status
-  // reporting)
-  sensorManager.setWeatherManager(&weatherManager);
-  weatherManager.update(); // Will fail gracefully if no WiFi
   sensorManager.begin();
   webManager.begin();
-
-  // Telegram Init
   telegramManager.begin();
-  String reason = getResetReason();
+  
+  // 6. Broadcast Startup
+  String reason = networkManager.getResetReason();
   String startupMsg = "🟢 **Система Запущена**\n";
-  startupMsg += "Версия: v3.4 (Fast Triggers + Timer)\n";
+  startupMsg += "Версия: v4.3 (Reactive Vibe)\n";
   startupMsg += "Причина: " + reason + "\n";
   startupMsg += "Heap: " + String(ESP.getFreeHeap() / 1024) + " KB";
   telegramManager.broadcastAlert(startupMsg, 1);
 
-  lastSensorRead = millis(); // Reset timer
-
-  // First read
-  sensorManager.update();
-
-  displayManager.update(sensorManager.getTemp(), sensorManager.getHum(),
-                        sensorManager.getDewPoint(), false,
-                        sensorManager.getRecommendation(),
-                        sensorManager.getAdviceCode(), // [NEW] Code
-                        sensorManager.getStateCode(),  // [NEW] State
-                        WiFi.localIP().toString());
+  // Initial Update
+  g_state.lock();
+  g_state.ipAddress = networkManager.getLocalIP();
+  g_state.unlock();
+  displayManager.update();
 }
 
 void loop() {
+  // ---------------------------------------------------------------------------
+  // REACTIVE LOOP (Sleep until notified)
+  // ---------------------------------------------------------------------------
+  
+  // Wait for notification from SensorManager (or timeout 1s)
+  // pdTRUE = Request to clear the notification value on exit
+  // pdMS_TO_TICKS(1000) = Wake up every 1s anyway (for maint tasks)
+  uint32_t notificationValue = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+  
   unsigned long now = millis();
 
-  // 0. Periodic Connectivity Check (every 30s)
-  static unsigned long lastConnCheck = 0;
-  if (now - lastConnCheck > 30000) {
-    lastConnCheck = now;
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WIFI] Reconnecting...");
-      WiFi.reconnect();
-    }
-    // NTP re-sync check (if time looks wrong)
-    if (time(NULL) < 1600000000) {
-      Serial.println("[NTP] Time invalid, re-syncing...");
-      configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
-    }
+  if (notificationValue > 0) {
+      // EVENT: New Sensor Data Available!
+      CoreSnapshot sn = g_state.getSnapshot();
+      
+      if (!isnan(sn.temp)) {
+          // A. Process Climate Logic
+          ClimateEngine::EngineResult result = engine.process(sn, now);
+          
+          // B. Update Data Hub
+          ClimateEngine::updateCoreState(g_state, result);
+          
+          // C. Reactivity (Update UI immediately)
+          displayManager.update();
+          
+          // D. Telegram Alerts (Target Met, etc)
+          telegramManager.update(); 
+      }
   }
 
-  // 1. Core Updates (Polling)
-  telegramManager.update(); // Handles incoming messages (non-blocking)
-
-  // 2. Periodic Sensor & Logic Update (Adaptive)
-  unsigned long dynamicInterval = SENSOR_INTERVAL_MS; // Default 2 mins
-  if (sensorManager.isRapidChange()) {
-    dynamicInterval = 10000; // 10 seconds (Rapid Mode)
-  }
-
-  if (now - lastSensorRead >= dynamicInterval) {
-    lastSensorRead = now;
-
-    weatherManager.update(); // Checks if 10m passed
-    sensorManager.update();  // Actual sensor read
-
-    // Update OLED immediately after new data
-    displayManager.update(
-        sensorManager.getTemp(), sensorManager.getHum(),
-        sensorManager.getDewPoint(), false, sensorManager.getRecommendation(),
-        sensorManager.getAdviceCode(), sensorManager.getStateCode(),
-        WiFi.localIP().toString());
-  }
-
-  // 3. Yield to system tasks (CRITICAL for WiFi stability)
-  delay(1);
+  // ---------------------------------------------------------------------------
+  // MAINTENANCE TASKS (Every 1s timeout)
+  // ---------------------------------------------------------------------------
+  
+  // 1. Network Maintainer (Reconnects if needed)
+  networkManager.update();
+  
+  // 2. Weather Update (Internal timer handles frequency)
+  weatherManager.update();
+  
+  // 3. Telegram Polling (Incoming messages)
+  telegramManager.update();
 }

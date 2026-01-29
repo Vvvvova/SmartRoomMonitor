@@ -1,8 +1,8 @@
 #include "TelegramManager.h"
 
-TelegramManager::TelegramManager(SensorManager* sm) 
-    : sensorManager(sm), lastPollTime(0), lastAdviceCode(-1), 
-      lastClimateState(SensorManager::ClimateState::STABLE), 
+TelegramManager::TelegramManager() 
+    : lastPollTime(0), lastAdviceCode(-1), 
+      lastClimateState(ClimateState::STABLE), 
       moldAlertSent(false), timeoutAlertSent(false) {
     // Insecure client for simplicity (no cert management)
     client.setInsecure();
@@ -36,30 +36,35 @@ void TelegramManager::update() {
     }
 
     // 2. Check for Alerts (Logic: Change of State)
-    SensorManager::ClimateState currentState = sensorManager->getClimateState();
+    // Read from CoreState (safe snapshot)
+    CoreSnapshot sn = g_state.getSnapshot();
+    ClimateState currentState = sn.state;
+    unsigned long stateEnterTime = sn.stateEnterTime;
+    float temp = sn.temp;
+    float dewPoint = sn.dewPoint;
     
     // --- STATE BASED ALERTS ---
     
     // A. Transition to TARGET_MET (Success)
-    if (lastClimateState == SensorManager::ClimateState::VENTILATING && currentState == SensorManager::ClimateState::TARGET_MET) {
+    if (lastClimateState == ClimateState::VENTILATING && currentState == ClimateState::TARGET_MET) {
         String msg = "✅ **Цель достигнута!**\nВлажность в норме. Можно закрывать.";
         broadcastAlert(msg, 1);
     }
 
     // B. Transition to INEFFICIENT (Stalled)
-    if (lastClimateState == SensorManager::ClimateState::VENTILATING && currentState == SensorManager::ClimateState::INEFFICIENT) {
+    if (lastClimateState == ClimateState::VENTILATING && currentState == ClimateState::INEFFICIENT) {
         String msg = "⚠️ **Эффективность упала**\nВлага почти не уходит. Закрывайте, чтобы не выстужать стены.";
         broadcastAlert(msg, 2);
     }
 
     // C. Rebound (Window Closed) - Silent Log
-    if (lastClimateState != SensorManager::ClimateState::STABLE && currentState == SensorManager::ClimateState::STABLE) {
+    if (lastClimateState != ClimateState::STABLE && currentState == ClimateState::STABLE) {
         Serial.println("Telegram: Окно закрыто (Отскок влажности)");
     }
     
     // B. Timeout (Safety Timer 20m)
-    if (currentState == SensorManager::ClimateState::VENTILATING) {
-        unsigned long dur = millis() - sensorManager->getStateEnterTime();
+    if (currentState == ClimateState::VENTILATING) {
+        unsigned long dur = millis() - stateEnterTime;
         if (dur > 20 * 60 * 1000 && !timeoutAlertSent) {
              broadcastAlert("⚠️ **Таймер безопасности:** 20 мин.\nРекомендуется закрыть окно во избежание переохлаждения.", 2);
              timeoutAlertSent = true;
@@ -70,7 +75,7 @@ void TelegramManager::update() {
     
     // C. Mold Risk (Independent Check)
     // Condition: Temp - DP < 3.0
-    float margin = sensorManager->getTemp() - sensorManager->getDewPoint();
+    float margin = temp - dewPoint;
     if (!isnan(margin) && margin < 3.0) {
         if (!moldAlertSent) {
             broadcastAlert("🔴 **Риск плесени!**\nСтены холодные. Требуется прогрев и осушение!", 2);
@@ -120,11 +125,14 @@ void TelegramManager::sendMainMenu(const String& chatId, const String& welcomeMs
 }
 
 void TelegramManager::sendStatus(const String& chatId) {
-    float t = sensorManager->getTemp();
-    float h = sensorManager->getHum();
-    float outT = sensorManager->getOutdoorTemp();
-    String advice = sensorManager->getRecommendation();
-    int code = sensorManager->getAdviceCode();
+    // Read from CoreState (safe snapshot)
+    CoreSnapshot sn = g_state.getSnapshot();
+    float t = sn.temp;
+    float h = sn.hum;
+    float outT = sn.outTemp;
+    String advice = sn.advice;
+    int code = sn.adviceCode;
+    String weatherStatus = sn.weatherStatus;
     
     String icon = "😐";
     if(code == 3) icon = "✅"; // Good/Safe
@@ -136,7 +144,7 @@ void TelegramManager::sendStatus(const String& chatId) {
     if(!isnan(outT)) {
         msg += "🌳 **Улица:** " + String(outT, 1) + "°C\n";
     } else {
-        msg += "🌑 **Погода:** " + sensorManager->getWeatherStatus() + "\n";
+        msg += "🌑 **Погода:** " + weatherStatus + "\n";
     }
     msg += "\n💡 **Совет:** " + advice;
     
@@ -165,8 +173,9 @@ void TelegramManager::toggleMute(const String& chatId) {
         if (sub.chatId == chatId) {
             sub.isMuted = !sub.isMuted;
             String status = sub.isMuted ? "🔇 Уведомления ОТКЛЮЧЕНЫ" : "🔔 Уведомления ВКЛЮЧЕНЫ";
-            bot->sendMessage(chatId, status, "Markdown");
+            bot->sendMessage(sub.chatId, status, "Markdown");
             return;
         }
     }
 }
+

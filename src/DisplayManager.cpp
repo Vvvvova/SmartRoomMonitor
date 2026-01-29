@@ -1,4 +1,5 @@
 #include "DisplayManager.h"
+#include "CoreState.h"
 #include <WiFi.h>
 
 DisplayManager::DisplayManager() 
@@ -22,12 +23,21 @@ bool DisplayManager::isNightMode() {
     return false;
 }
 
-void DisplayManager::update(float t, float h, float dp, bool win, String advice, int adviceCode, int rawState, String ip) {
+void DisplayManager::update() {
     if(isNightMode()) {
         display.clearDisplay();
         display.display();
         return;
     }
+
+    // Read from CoreState (safe snapshot)
+    CoreSnapshot sn = g_state.getSnapshot();
+    float t = sn.temp;
+    float h = sn.hum;
+    float dp = sn.dewPoint;
+    int adviceCode = sn.adviceCode;
+    ClimateState rawState = sn.state;
+    String ip = sn.ipAddress;
 
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
@@ -48,9 +58,9 @@ void DisplayManager::update(float t, float h, float dp, bool win, String advice,
     }
     
     // Overrides based on internal State Machine (rawState)
-    // 0=STABLE, 1=VENTILATING, 2=PLATEAU
-    if (rawState == 1) lcdAdvice = "DRYING...";
-    if (rawState == 2) lcdAdvice = "PLATEAU";
+    if (rawState == ClimateState::VENTILATING) lcdAdvice = "DRYING...";
+    if (rawState == ClimateState::TARGET_MET)  lcdAdvice = "TARGET MET";
+    if (rawState == ClimateState::INEFFICIENT) lcdAdvice = "PLATEAU";
 
     display.print(lcdAdvice);
     
@@ -69,9 +79,6 @@ void DisplayManager::update(float t, float h, float dp, bool win, String advice,
     // Footer Info
     display.setTextSize(1);
     display.setCursor(0, 44);
-    if(win) {
-         display.print(F("[WIN OPEN] "));
-    }
     display.print(F("DP:"));
     if(!isnan(dp)) display.print(dp, 1);
     
@@ -80,3 +87,4 @@ void DisplayManager::update(float t, float h, float dp, bool win, String advice,
 
     display.display();
 }
+

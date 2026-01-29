@@ -2,14 +2,12 @@
 #include <Arduino.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
-#include "SensorManager.h"
 
 class WebManager {
 public:
-    WebManager(SensorManager* sm);
+    WebManager();
     void begin();
 
 private:
     AsyncWebServer server;
-    SensorManager* sensorManager;
 };

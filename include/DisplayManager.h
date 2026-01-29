@@ -9,7 +9,7 @@ class DisplayManager {
 public:
     DisplayManager();
     void begin();
-    void update(float t, float h, float dp, bool win, String advice, int adviceCode, int rawState, String ip);
+    void update();  // Reads from g_state directly
 
 private:
     Adafruit_SSD1306 display;
