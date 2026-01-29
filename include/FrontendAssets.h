@@ -324,7 +324,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
 
         initCharts();
-        setInterval(fetchStatus, 3000); // 3s Status
+        setInterval(fetchStatus, 10000); // 10s Status
         setInterval(fetchHistory, 60000); // 60s Graph
         fetchStatus();
         fetchHistory();

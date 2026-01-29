@@ -1,7 +1,7 @@
 #include "NetworkManager.h"
 
 NetworkManager::NetworkManager() 
-    : lastConnCheck(0), initialSyncDone(false) {}
+    : lastConnCheck(0), initialSyncDone(false), lastTimeSyncAttempt(0) {}
 
 void NetworkManager::begin() {
     // 1. WiFi Init
@@ -45,6 +45,25 @@ void NetworkManager::update() {
             g_state.unlock();
         }
     }
+
+    // Check Time Sync if not done (every 10s)
+    if (!initialSyncDone && WiFi.status() == WL_CONNECTED) {
+        if (now - lastTimeSyncAttempt > 10000) {
+            lastTimeSyncAttempt = now;
+            struct tm timeinfo;
+            // Non-blocking check (10ms timeout)
+            if (getLocalTime(&timeinfo, 10)) {
+                initialSyncDone = true;
+                time_t t = time(NULL);
+                Serial.printf("[NET] Time Synced (Background): %lu\n", (unsigned long)t);
+            } else {
+                // If we are connected but no time, maybe NTP needs a kick
+                // Calling configTime again is safe and might trigger re-sync
+                configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+                Serial.println("[NET] Retrying Time Sync...");
+            }
+        }
+    }
 }
 
 void NetworkManager::connectWiFi() {
@@ -82,7 +101,7 @@ void NetworkManager::syncTime() {
         initialSyncDone = true;
         Serial.println("[NET] Time Synced");
     } else {
-        Serial.println("[NET] Time Sync Failed");
+        Serial.println("[NET] Time Sync Failed (Will retry in background)");
     }
 }
 

@@ -65,7 +65,7 @@ void SensorManager::processReading(float rawT, float rawH) {
   if (!ClimateMath::isJumpValid(t, lastValidTemp, MAX_TEMP_JUMP)) {
       t = lastValidTemp;
   } else {
-      t = ClimateMath::lowPassFilter(t, lastValidTemp, 0.2f);
+      t = ClimateMath::lowPassFilter(t, lastValidTemp, EMA_ALPHA);
   }
   lastValidTemp = t;
 

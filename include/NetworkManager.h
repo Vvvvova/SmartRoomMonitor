@@ -33,4 +33,6 @@ private:
     
     unsigned long lastConnCheck;
     bool initialSyncDone;
+    unsigned long lastTimeSyncAttempt;
+
 };

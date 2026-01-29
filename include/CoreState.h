@@ -124,7 +124,7 @@ struct CoreState {
     void addHistoryPoint(float t, float h) {
         // NOTE: Caller must hold lock()!
         time_t now = time(NULL);
-        if (now < 1600000000) return; // Skip invalid time
+        if (now < 1000000) return; // Skip if time is near 1970 (less than 11 days after 1970)
 
         Record r = {(uint32_t)now, t, h};
         history[historyHead] = r;

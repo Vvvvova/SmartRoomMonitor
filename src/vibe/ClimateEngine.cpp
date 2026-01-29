@@ -8,22 +8,17 @@ ClimateEngine::ClimateEngine()
       baselineUpdateCounter(0), reboundStartTime(0), reboundStartTemp(NAN),
       triggerConfirmCount(0), prevAbsHumForTrigger(NAN),
       state(ClimateState::STABLE), stateEnterTime(0),
-      lastHistoryLogTime(0) {
+      lastHistoryLogTime(0), lastSlopeUpdateTime(0),
+      lastBaselineUpdateTime(0) {
     for (size_t i = 0; i < SLOPE_WINDOW_SIZE; i++) {
         slopeWindow[i] = NAN;
     }
 }
 
 unsigned long ClimateEngine::getSuggestedTickInterval() const {
-    // Active states need faster polling for responsiveness
-    if (state == ClimateState::VENTILATING) return 10000; // 10s
-    
-    // Intermediate states
-    if (state == ClimateState::TARGET_MET || state == ClimateState::INEFFICIENT) return 30000; // 30s
-    
-    // Stable state - save battery/cpu, but keeping it reasonable
-    // Default was ~2 mins in main.cpp logic
-    return 120000; // 2 minutes
+    // Balanced 10s polling: fast enough to catch windows, 
+    // slow enough to prevent DHT22 self-heating.
+    return 10000; 
 }
 
 ClimateEngine::EngineResult ClimateEngine::process(const CoreSnapshot& sn, unsigned long now) {
@@ -42,10 +37,8 @@ ClimateEngine::EngineResult ClimateEngine::process(const CoreSnapshot& sn, unsig
         prevAbsHumForTrigger = absHum;
     }
 
-    // 2. Update slope tracking during ventilation
-    if (state != ClimateState::STABLE) {
-        updateSlope(absHum);
-    }
+    // 2. Slope updates are now handled in the History Logging section below
+    // to maintain a consistent 3-minute analysis rhythm.
 
     // 3. Prepare State Machine Inputs
     float slopeNewest = NAN, slopeOldest = NAN;
@@ -76,6 +69,7 @@ ClimateEngine::EngineResult ClimateEngine::process(const CoreSnapshot& sn, unsig
     in.slopeCount = slopeWindowCount;
     in.stateEnterHum = stateEnterHum;
     in.stateEnterAbsHum = stateEnterAbsHum;
+    in.lastBaselineUpdateTime = lastBaselineUpdateTime;
 
     // 4. Run Pure Decision Logic
     StateOutput out = computeTransition(in);
@@ -96,6 +90,7 @@ ClimateEngine::EngineResult ClimateEngine::process(const CoreSnapshot& sn, unsig
         lastTempForWindowCheck = out.newBaseTemp;
         lastHumForWindowCheck = out.newBaseHum;
         lastAbsHumForWindowCheck = out.newBaseAbsHum;
+        lastBaselineUpdateTime = now; // Sync time-based baseline
     }
 
     if (out.transitionReason != nullptr && changed) {
@@ -144,12 +139,19 @@ ClimateEngine::EngineResult ClimateEngine::process(const CoreSnapshot& sn, unsig
     // B. Poll Interval Logic
     result.suggestPollInterval = getSuggestedTickInterval();
     
-    // C. History Logging Logic
-    // Logic: 30s in active mode, 3m in stable mode
-    unsigned long logInterval = (state == ClimateState::VENTILATING) ? 30000 : 180000;
-    if (now - lastHistoryLogTime >= logInterval) {
+    // C. History Logging Logic (Always 3 mins for consistent graph length)
+    unsigned long logInterval = 180000;
+    
+    bool timeValid = (time(NULL) > 1000000);
+
+    if (timeValid && (lastHistoryLogTime == 0 || now - lastHistoryLogTime >= logInterval)) {
         result.shouldLogHistory = true;
         lastHistoryLogTime = now;
+        
+        // Update slope window ONLY during logging to maintain 3-min intervals (Analysis window = 18 mins)
+        if (state != ClimateState::STABLE) {
+            updateSlope(absHum);
+        }
     } else {
         result.shouldLogHistory = false;
     }
@@ -222,9 +224,12 @@ ClimateEngine::computeTransition(const StateInput& in) {
     bool rapidTempDrop = (!isnan(in.baseTemp) && (in.baseTemp - in.temp) > VENT_TRIGGER_TEMP_DROP);
     bool rapidAbsHumDrop = (!isnan(in.prevAbsHum) && (in.prevAbsHum - in.absHum) > VENT_TRIGGER_ABSHUM_DROP);
 
+    // If polling is slow (30s), even 1 confirm is enough, but for 6s we keep 2-3
+    unsigned int confTarget = (in.now - in.stateEnterTime < 6500) ? VENT_TRIGGER_CONFIRM : 1;
+
     if ((rapidHumDrop || rapidTempDrop || rapidAbsHumDrop) && !lockoutActive) {
       out.newTriggerCount = in.triggerConfirmCount + 1;
-      if (out.newTriggerCount >= VENT_TRIGGER_CONFIRM) {
+      if (out.newTriggerCount >= confTarget) {
         out.newState = ClimateState::VENTILATING;
         out.newStateEnterTime = in.now;
         out.newStateEnterHum = in.hum;
@@ -240,13 +245,13 @@ ClimateEngine::computeTransition(const StateInput& in) {
       out.newTriggerCount = 0;
     }
 
-    out.newBaselineCounter = in.baselineUpdateCount + 1;
-    if (out.newBaselineCounter >= 50) {
-      out.newBaselineCounter = 0;
+    // Every 90 minutes update long-term baseline
+    if (in.lastBaselineUpdateTime == 0 || in.now - in.lastBaselineUpdateTime >= 5400000) {
       out.updateBaseline = true;
       out.newBaseTemp = in.temp;
       out.newBaseHum = in.hum;
       out.newBaseAbsHum = in.absHum;
+      // We'll update lastBaselineUpdateTime in process()
     }
   }
 
@@ -365,16 +370,13 @@ void ClimateEngine::updateCoreState(CoreState& state, const EngineResult& result
 
     // History Logging
     if (result.shouldLogHistory) {
-         // Snapshot already contains temp/hum from this cycle, 
-         // but wait - result does NOT contain temp/hum. 
-         // We need to fetch current values from state? 
-         // NO, fetching from state inside lock is safe.
-         // BUT wait, state.temp might be updated by SensorManager since we started processing?
-         // Actually, SensorManager writes -> updates timestamp. 
-         // Main loop sees timestamp -> processes -> writes result.
-         // SensorManager won't write again until we finish this cycle ideally, 
-         // OR if it does, using the latest temp is fine.
          state.addHistoryPoint(state.temp, state.hum);
+
+         // Update 24h average ONLY when adding history points (matching master rhythm)
+         if (!isnan(state.hum)) {
+             if (isnan(state.avg24h)) state.avg24h = state.hum;
+             else state.avg24h = (state.avg24h * (1.0f - ALPHA_24H)) + (state.hum * ALPHA_24H);
+         }
     }
     state.unlock();
 }

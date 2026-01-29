@@ -52,6 +52,7 @@ public:
         float slopeNewest, slopeOldest;
         size_t slopeCount;
         float stateEnterHum, stateEnterAbsHum;
+        unsigned long lastBaselineUpdateTime;
     };
 
     struct StateOutput {
@@ -119,6 +120,8 @@ private:
 
     void updateSlope(float absHum);
     
-    // Internal History Timer
+    // Internal Timers
     unsigned long lastHistoryLogTime;
+    unsigned long lastSlopeUpdateTime;
+    unsigned long lastBaselineUpdateTime;
 };
