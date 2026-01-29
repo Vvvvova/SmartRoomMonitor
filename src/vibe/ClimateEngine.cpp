@@ -6,6 +6,7 @@ ClimateEngine::ClimateEngine()
       lastAbsHumForWindowCheck(NAN), stateEnterAbsHum(NAN), stateEnterHum(NAN),
       slopeWindowHead(0), slopeWindowCount(0), plateauConfirmCounter(0),
       baselineUpdateCounter(0), reboundStartTime(0), reboundStartTemp(NAN),
+      reboundMinAbsHum(NAN),
       triggerConfirmCount(0), prevAbsHumForTrigger(NAN),
       state(ClimateState::STABLE), stateEnterTime(0),
       lastHistoryLogTime(0), lastSlopeUpdateTime(0),
@@ -63,6 +64,7 @@ ClimateEngine::EngineResult ClimateEngine::process(const CoreSnapshot& sn, unsig
     in.plateauConfirmCount = plateauConfirmCounter;
     in.baselineUpdateCount = baselineUpdateCounter;
     in.reboundStartTemp = reboundStartTemp;
+    in.reboundMinAbsHum = reboundMinAbsHum;
     in.reboundStartTime = reboundStartTime;
     in.slopeNewest = slopeNewest;
     in.slopeOldest = slopeOldest;
@@ -82,6 +84,7 @@ ClimateEngine::EngineResult ClimateEngine::process(const CoreSnapshot& sn, unsig
     plateauConfirmCounter = out.newPlateauCount;
     baselineUpdateCounter = out.newBaselineCounter;
     reboundStartTemp = out.newReboundStartTemp;
+    reboundMinAbsHum = out.newReboundMinAbsHum;
     reboundStartTime = out.newReboundStartTime;
     stateEnterHum = out.newStateEnterHum;
     stateEnterAbsHum = out.newStateEnterAbsHum;
@@ -256,98 +259,116 @@ ClimateEngine::computeTransition(const StateInput& in) {
   }
 
   // --- VENTILATING ---
-  else if (in.currentState == ClimateState::VENTILATING) {
-    float targetHum = fmax(50.0f, in.stateEnterHum - 15.0f);
-    if (in.hum <= targetHum) {
-      out.newState = ClimateState::TARGET_MET;
-      out.newStateEnterTime = in.now;
-      out.updateBaseline = true;
-      out.newBaseTemp = in.temp;
-      out.newBaseHum = in.hum;
-      out.newBaseAbsHum = in.absHum;
-      out.transitionReason = "VENTILATING -> TARGET_MET";
-    }
-    else if (timeSinceStateEnter > 180000 && in.slopeCount >= 3) {
-      float slope = in.slopeNewest - in.slopeOldest;
-      float adaptiveThreshold = PLATEAU_SLOPE_THRESHOLD;
-      if (!isnan(in.stateEnterHum)) {
-        float humFactor = fmin(fmax(in.stateEnterHum, 50.0f), 70.0f) - 50.0f;
-        adaptiveThreshold = PLATEAU_SLOPE_THRESHOLD - (humFactor * 0.003f);
-      }
-
-      if (!isnan(slope) && slope > 0.05f) {
-        out.newState = ClimateState::STABLE;
+  // --- NON-STABLE STATES (VENTILATING, TARGET_MET, INEFFICIENT) ---
+  else {
+    // 1. VENTILATING Specific: Check for success or plateau
+    if (in.currentState == ClimateState::VENTILATING) {
+      float targetHum = fmax(50.0f, in.stateEnterHum - 15.0f);
+      if (in.hum <= targetHum) {
+        out.newState = ClimateState::TARGET_MET;
         out.newStateEnterTime = in.now;
         out.updateBaseline = true;
         out.newBaseTemp = in.temp;
         out.newBaseHum = in.hum;
         out.newBaseAbsHum = in.absHum;
-        out.transitionReason = "VENTILATING -> STABLE (Rising hum)";
-      } else if (!isnan(slope) && slope > adaptiveThreshold) {
-        out.newPlateauCount = in.plateauConfirmCount + 1;
-        if (out.newPlateauCount >= PLATEAU_CONFIRM_COUNT) {
-          out.newState = ClimateState::INEFFICIENT;
+        out.transitionReason = "Target humidity reached";
+      }
+      else if (timeSinceStateEnter > 180000 && in.slopeCount >= 3) {
+        float slope = in.slopeNewest - in.slopeOldest;
+        float adaptiveThreshold = PLATEAU_SLOPE_THRESHOLD;
+        if (!isnan(in.stateEnterHum)) {
+          float humFactor = fmin(fmax(in.stateEnterHum, 50.0f), 70.0f) - 50.0f;
+          adaptiveThreshold = PLATEAU_SLOPE_THRESHOLD - (humFactor * 0.003f);
+        }
+
+        if (!isnan(slope) && slope > 0.05f) {
+          out.newState = ClimateState::STABLE;
           out.newStateEnterTime = in.now;
           out.updateBaseline = true;
           out.newBaseTemp = in.temp;
           out.newBaseHum = in.hum;
           out.newBaseAbsHum = in.absHum;
-          out.transitionReason = "VENTILATING -> INEFFICIENT (Plateau)";
+          out.transitionReason = "Rebound: Humidity rising (Window closed?)";
+        } else if (!isnan(slope) && slope > adaptiveThreshold) {
+          out.newPlateauCount = in.plateauConfirmCount + 1;
+          if (out.newPlateauCount >= PLATEAU_CONFIRM_COUNT) {
+            out.newState = ClimateState::INEFFICIENT;
+            out.newStateEnterTime = in.now;
+            out.updateBaseline = true;
+            out.newBaseTemp = in.temp;
+            out.newBaseHum = in.hum;
+            out.newBaseAbsHum = in.absHum;
+            out.transitionReason = "Drying reached plateau";
+          }
+        } else {
+          out.newPlateauCount = 0;
         }
-      } else {
-        out.newPlateauCount = 0;
       }
     }
 
-    // Rebound
-    if (out.newState == ClimateState::VENTILATING) {
-      if (!isnan(in.reboundStartTemp)) {
-        if ((in.temp - in.reboundStartTemp) > REBOUND_TEMP_RISE && (in.now - in.reboundStartTime) > REBOUND_TIME_MS) {
+    // 2. SHARED REBOUND: Check for window close in any active mode
+    if (out.newState != ClimateState::STABLE) {
+      // Temperature Trough Tracking
+      if (isnan(in.reboundStartTemp) || in.temp < in.reboundStartTemp) {
+          out.newReboundStartTemp = in.temp;
+          out.newReboundStartTime = in.now;
+      } 
+      
+      // AbsHum Trough (The "Smoking Gun" of closed window)
+      if (isnan(in.reboundMinAbsHum) || in.absHum < in.reboundMinAbsHum) {
+          out.newReboundMinAbsHum = in.absHum;
+      } else {
+          out.newReboundMinAbsHum = in.reboundMinAbsHum;
+      }
+
+      // --- EXIT CONDITIONS ---
+      
+      // A. Temperature turnaround (Sustained rise)
+      if (!isnan(out.newReboundStartTemp) && (in.temp - out.newReboundStartTemp) >= REBOUND_TEMP_RISE) {
+          if (in.now - out.newReboundStartTime >= REBOUND_TIME_MS) {
+              out.newState = ClimateState::STABLE;
+              out.newStateEnterTime = in.now;
+              out.updateBaseline = true;
+              out.transitionReason = "Rebound: Sustained Temp rise";
+          }
+      }
+
+      // B. Humidity turnaround (Steady climb from trough)
+      if (out.newState != ClimateState::STABLE && !isnan(out.newReboundMinAbsHum)) {
+          // If AbsHum rises by 0.15 from its lowest point AND current AbsHum is steady above it
+          if (in.absHum > out.newReboundMinAbsHum + 0.15f) {
+              out.newState = ClimateState::STABLE;
+              out.newStateEnterTime = in.now;
+              out.updateBaseline = true;
+              out.transitionReason = "Rebound: AbsHum turnaround";
+          }
+      }
+
+      // C. Immediate Fallback: Rapid rise between readings (10s)
+      if (out.newState != ClimateState::STABLE && !isnan(in.prevAbsHum)) {
+          if (in.absHum > in.prevAbsHum + 0.3f) { // Increased to 0.3 for noise protection
+              out.newState = ClimateState::STABLE;
+              out.newStateEnterTime = in.now;
+              out.updateBaseline = true;
+              out.transitionReason = "Rebound: Rapid AbsHum jump";
+          }
+      }
+
+      // D. Pre-ventilation recovery
+      if (out.newState != ClimateState::STABLE && (in.absHum - in.baseAbsHum) > REBOUND_ABSHUM_RISE) {
           out.newState = ClimateState::STABLE;
           out.newStateEnterTime = in.now;
           out.updateBaseline = true;
-          out.transitionReason = "VENTILATING -> STABLE (Rebound Temp)";
-        } else if (in.temp < in.reboundStartTemp) out.newReboundStartTemp = NAN;
-      } else if (in.temp > in.baseTemp + 0.05f) {
-        out.newReboundStartTemp = in.baseTemp;
-        out.newReboundStartTime = in.now;
+          out.transitionReason = "Rebound: AbsHum > Baseline";
       }
 
-      if (out.newState == ClimateState::VENTILATING && (in.absHum - in.baseAbsHum) > REBOUND_ABSHUM_RISE) {
-        out.newState = ClimateState::STABLE;
-        out.newStateEnterTime = in.now;
-        out.updateBaseline = true;
-        out.transitionReason = "VENTILATING -> STABLE (Rebound AbsHum)";
+      // E. Safety Timeout (1h)
+      if (out.newState != ClimateState::STABLE && timeSinceStateEnter > 3600000) {
+          out.newState = ClimateState::STABLE;
+          out.newStateEnterTime = in.now;
+          out.updateBaseline = true;
+          out.transitionReason = "Safety Timeout (1h)";
       }
-    }
-  }
-  
-  // --- TARGET_MET / INEFFICIENT (Shared rebound logic) ---
-  else {
-    if (!isnan(in.reboundStartTemp)) {
-      if ((in.temp - in.reboundStartTemp) > REBOUND_TEMP_RISE && (in.now - in.reboundStartTime) > REBOUND_TIME_MS) {
-        out.newState = ClimateState::STABLE;
-        out.newStateEnterTime = in.now;
-        out.updateBaseline = true;
-        out.transitionReason = "CLOSE -> STABLE (Rebound Temp)";
-      } else if (in.temp < in.reboundStartTemp) out.newReboundStartTemp = NAN;
-    } else if (in.temp > in.baseTemp + 0.05f) {
-      out.newReboundStartTemp = in.baseTemp;
-      out.newReboundStartTime = in.now;
-    }
-
-    if (out.newState != ClimateState::STABLE && (in.absHum - in.baseAbsHum) > REBOUND_ABSHUM_RISE) {
-      out.newState = ClimateState::STABLE;
-      out.newStateEnterTime = in.now;
-      out.updateBaseline = true;
-      out.transitionReason = "CLOSE -> STABLE (Rebound AbsHum)";
-    }
-
-    if (out.newState != ClimateState::STABLE && timeSinceStateEnter > 3600000) {
-      out.newState = ClimateState::STABLE;
-      out.newStateEnterTime = in.now;
-      out.updateBaseline = true;
-      out.transitionReason = "CLOSE -> STABLE (Timeout)";
     }
   }
 

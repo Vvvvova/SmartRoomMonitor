@@ -48,6 +48,7 @@ public:
         unsigned int plateauConfirmCount;
         unsigned int baselineUpdateCount;
         float reboundStartTemp;
+        float reboundMinAbsHum;
         unsigned long reboundStartTime;
         float slopeNewest, slopeOldest;
         size_t slopeCount;
@@ -64,6 +65,7 @@ public:
         unsigned int newPlateauCount;
         unsigned int newBaselineCounter;
         float newReboundStartTemp;
+        float newReboundMinAbsHum;
         unsigned long newReboundStartTime;
         float newStateEnterHum, newStateEnterAbsHum;
         const char* transitionReason;
@@ -109,6 +111,7 @@ private:
     // Improved Rebound Detection
     unsigned long reboundStartTime;
     float reboundStartTemp;
+    float reboundMinAbsHum;
 
     // Smart Triggers
     unsigned int triggerConfirmCount;
